@@ -1031,7 +1031,11 @@ __launch_bounds__(block_dim_x) void kernel(
     OutputBuffer<SeedPos> outputs,
     const KernelSeed1::Result* __restrict__ results)
 {
-  __shared__ alignas(16) ImprovedNoise oct_0A;
+  // Double-buffered: each seed's noise struct is fetched while the previous
+  // seed is still being worked on. Loaded in place, the block stalled on this
+  // global read at a barrier once per seed -- measured at 1.10 ms of the
+  // stage, 4.8%, by pointing the load at a fixed always-cached address.
+  __shared__ alignas(16) ImprovedNoise oct_buf[2];
   // Occupancy is at its optimum here and should be left alone. This block uses
   // 17712 bytes of shared memory, which fits 5 blocks per SM (62% occupancy).
   // Both neighbours were built and measured round-robin against it:
@@ -1099,15 +1103,27 @@ __launch_bounds__(block_dim_x) void kernel(
   }
 
   const uint32_t seeds_len = *seeds.len;
+
+  uint32_t buf = 0u;
+  if (blockIdx.x < seeds_len && nz < 17) {
+    reinterpret_cast<uint4*>(&oct_buf[0])[nz] =
+        reinterpret_cast<const uint4*>(&results[blockIdx.x].continentalness_0A)[nz];
+  }
+
   for (uint32_t seed_index = blockIdx.x; seed_index < seeds_len; seed_index += gridDim.x) {
+    // This barrier both releases the shared tables from the previous seed and
+    // publishes the fetch issued during it, so the second barrier the in-place
+    // load needed is gone.
     __syncthreads();
 
-    if (nz < 17) {
-      reinterpret_cast<uint4*>(&oct_0A)[nz] =
-          reinterpret_cast<const uint4*>(&results[seed_index].continentalness_0A)[nz];
+    const uint32_t next_seed = seed_index + gridDim.x;
+    if (next_seed < seeds_len && nz < 17) {
+      reinterpret_cast<uint4*>(&oct_buf[buf ^ 1u])[nz] =
+          reinterpret_cast<const uint4*>(&results[next_seed].continentalness_0A)[nz];
     }
 
-    __syncthreads();
+    const ImprovedNoise &oct_0A = oct_buf[buf];
+    buf ^= 1u;
 
     {
       uint32_t p_z[6];
