@@ -1230,25 +1230,48 @@ __launch_bounds__(block_dim_x) void kernel(
     }
 
     uint32_t sq_n = 0;   // uniform across the warp
-    for (uint32_t i = 0; i < n_cand; ++i) {
-      const uint32_t t = cand_t[i];          // broadcast
-      const float    a = cand_a[i];          // broadcast
-      const float    b = conv_z0[(t + d) & 0xFF][2];
-      const bool hit = (a + b >= kGradVecs1GateZ0Threshold);
+    const uint32_t lanemask_lt = (1u << lane) - 1u;
 
-      const uint32_t m = __ballot_sync(0xFFFFFFFFu, hit);
-      if (hit) {
-        score_q[warp][sq_n + __popc(m & ((1u << lane) - 1u))] = (nx << 8) | t;
+    // The gate passes about 166 of a seed's 65536 positions, so 97.7% of these
+    // checks fail. Running the queue machinery -- a ballot, two popcounts, a
+    // predicated shared store and the drain test -- once per candidate spends
+    // that bookkeeping almost entirely on misses. Up to 32 gate results fit in
+    // a bitmask instead, so the scan loop keeps only the work that actually
+    // depends on the candidate and the warp-wide part runs once per set bit.
+    for (uint32_t base = 0; base < n_cand; base += 32u) {
+      const uint32_t n_this = (n_cand - base) < 32u ? (n_cand - base) : 32u;
+
+      uint32_t hitmask = 0u;
+      for (uint32_t j = 0; j < n_this; ++j) {
+        const uint32_t t = cand_t[base + j];   // broadcast
+        const float    a = cand_a[base + j];   // broadcast
+        const float    b = conv_z0[(t + d) & 0xFF][2];
+        if (a + b >= kGradVecs1GateZ0Threshold) { hitmask |= (1u << j); }
       }
-      sq_n += __popc(m);
 
-      if (sq_n >= 32u) {
-        __syncwarp();
-        OMISSION_SCORE_DRAIN(32u)
-        __syncwarp();
-        sq_n -= 32u;
-        if (lane < sq_n) { score_q[warp][lane] = score_q[warp][lane + 32]; }
-        __syncwarp();
+      // Drains one hit per lane per pass, so this runs as many times as the
+      // busiest lane in the warp has hits -- about three, against n_cand
+      // ballots before. Every lane stays in the loop until the ballot is empty,
+      // which keeps __ballot_sync fully populated.
+      for (;;) {
+        const bool have = (hitmask != 0u);
+        const uint32_t m = __ballot_sync(0xFFFFFFFFu, have);
+        if (m == 0u) { break; }
+        if (have) {
+          const uint32_t j = (uint32_t)__ffs((int)hitmask) - 1u;
+          hitmask &= hitmask - 1u;
+          score_q[warp][sq_n + __popc(m & lanemask_lt)] = (nx << 8) | cand_t[base + j];
+        }
+        sq_n += __popc(m);
+
+        if (sq_n >= 32u) {
+          __syncwarp();
+          OMISSION_SCORE_DRAIN(32u)
+          __syncwarp();
+          sq_n -= 32u;
+          if (lane < sq_n) { score_q[warp][lane] = score_q[warp][lane + 32]; }
+          __syncwarp();
+        }
       }
     }
 
