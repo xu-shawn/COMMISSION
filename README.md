@@ -30,9 +30,9 @@ make PRESET=record UNBOUND=1       # unbounded small biomes -> main-sbu-record
 - Give every machine its own `--start`. Two runs with the same start scan the same seeds in the same order.
 - Speeds, bounded, G seeds per second: RTX 5090 120, RTX 4090 95, RTX 5080 66, RTX 4080 Super 56,
   RTX 4070 Ti Super 49, RTX 5070 39, RTX 4060 Ti 25, RTX 3080 25, RTX 3060 Ti 19. Two cards give twice one.
-- Islands above 11M appear at about 0.8 per 10¹⁵ bounded seeds and thin out by e per 0.33M of size, so an
-  island above the current bounded record (12,618,448) takes about 1.8 × 10¹⁷ seeds, give or take a
-  factor 2: roughly 60 days of one RTX 4090.
+- Islands above 11M appear at about 0.8 per 10¹⁵ bounded seeds and thin out by e per 0.3M of size, so an
+  island above the current bounded record (12,618,448) takes about 2.4 × 10¹⁷ seeds (68% range
+  1.1–5.3 × 10¹⁷): about 30 days of one RTX 4090 at 95 G seeds/s, or roughly $230 of rented GPUs.
 - The preset was validated for small biomes only. The branch also fixes an overflow that made the
   large-biomes CPU pre-test accept every candidate.
 - `docs/search-economics.md` has the measurements; `tools/` has the verification and analysis programs.
