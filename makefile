@@ -3,15 +3,8 @@ CUBIOMES_SRC := $(addprefix cubiomes/,biomenoise.c biomes.c finders.c generator.
 LARGE_BIOMES ?= 0
 UNBOUND ?= 0
 
-ifeq (UNBOUND, 1)
-	BIN_SUFFIX += u
-endif
-
-ifeq (LARGE_BIOMES, 1)
-	BIN_SUFFIX += lb
-else
-	BIN_SUFFIX += sb
-endif
+# main-sb, main-sbu, main-lb, main-lbu; -record appended for PRESET=record
+BIN_SUFFIX := $(if $(filter 1,$(LARGE_BIOMES)),lb,sb)$(if $(filter 1,$(UNBOUND)),u,)$(if $(filter record,$(PRESET)),-record,)
 
 PRINT_INTERVAL ?= 256
 # Auto-detect GPU architecture:
@@ -31,7 +24,12 @@ endif
 
 $(info Using ARCH = $(ARCH))
 override CFLAGS += -O3
-override CXXFLAGS += -O3 -std=c++20 -I asio/asio/include -DOMISSION_LARGE_BIOMES=$(LARGE_BIOMES) -DOMISSION_UNBOUND=$(UNBOUND) -DPRINT_INTERVAL=$(PRINT_INTERVAL)
+# Search tunables (src/tune.h):  make PRESET=record   or   make TUNE="-DTUNE_MAX_SCORE=0.046f"
+TUNE ?=
+ifeq ($(PRESET),record)
+  override TUNE += -DTUNE_PRESET_RECORD=1
+endif
+override CXXFLAGS += -O3 -std=c++20 -I asio/asio/include -DOMISSION_LARGE_BIOMES=$(LARGE_BIOMES) -DOMISSION_UNBOUND=$(UNBOUND) -DPRINT_INTERVAL=$(PRINT_INTERVAL) $(TUNE)
 override NVCC_FLAGS += $(CXXFLAGS) --expt-relaxed-constexpr --default-stream per-thread -arch=$(ARCH) -use_fast_math
 
 ifeq ($(OS),Windows_NT)
@@ -43,7 +41,7 @@ SRC_CU  := $(wildcard src/*.cu)
 SRC     := $(SRC_CPP) $(SRC_C) $(SRC_CU)
 
 clean:
-	del /Q main.exe
+	del /Q main*.exe
 
 # nvcc src/*.cpp src/*.c src/*.cu -o main.exe cubiomes/biomenoise.c cubiomes/biomes.c cubiomes/finders.c cubiomes/generator.c cubiomes/layers.c cubiomes/noise.c -arch=native -O3 -std=c++20 -I asio-1.34.2/include -DOMISSION_LARGE_BIOMES=1 --expt-relaxed-constexpr --default-stream per-thread -D_WIN32_WINNT=0x0601
 main.exe: $(SRC) $(CUBIOMES_SRC)
@@ -81,7 +79,7 @@ endif
 all: main
 
 clean:
-	rm -f main libcubiomes.a biomenoise.o biomes.o finders.o generator.o layers.o noise.o cubiomes.o gpu.o cpu.o client.o server.o
+	rm -f main main-* libcubiomes.a biomenoise.o biomes.o finders.o generator.o layers.o noise.o cubiomes.o gpu.o cpu.o client.o server.o
 
 libcubiomes.a: $(CUBIOMES_SRC)
 	$(CC) -c $(CUBIOMES_SRC) -fwrapv $(CFLAGS)
@@ -90,7 +88,7 @@ libcubiomes.a: $(CUBIOMES_SRC)
 cubiomes.o: src/cubiomes.c src/cubiomes.h
 	$(CC) -c $< -o $@ $(CFLAGS)
 
-gpu.o: src/gpu.cu src/gpu.h src/common.h src/Random.h src/kernel_0A.h src/kernel_0B.h
+gpu.o: src/gpu.cu src/gpu.h src/common.h src/Random.h src/kernel_0A.h src/kernel_0B.h src/tune.h
 	nvcc -c $< -o $@ $(NVCC_FLAGS)
 
 cpu.o: src/cpu.cpp src/cpu.h src/common.h src/cubiomes.h

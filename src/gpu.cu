@@ -1,5 +1,6 @@
 #include "Random.h"
 #include "gpu.h"
+#include "tune.h"
 
 #include <array>
 #include <bit>
@@ -383,7 +384,7 @@ __device__ inline void XrsrRandom_double_fork(XrsrRandom &rng, XrsrRandomFork &f
 
 namespace KernelFilterSeeds {
 constexpr uint32_t threads_per_block = 256;
-constexpr uint32_t threads_per_run = UINT64_C(1) << 28; //28
+constexpr uint32_t threads_per_run = UINT64_C(1) << TUNE_LOG2_BATCH;
 constexpr uint32_t seeds_per_thread = 32;
 
 __device__ XrsrRandomFork noise_yo_fork(XrsrRandomFork noise_fork) {
@@ -403,6 +404,22 @@ constexpr XrsrForkHash octave_yo_fork_hash(XrsrForkHash hash) {
   rng.nextInternal();
   return {rng.lo, rng.hi};
 }
+
+// penalty of one octave's vertical offset, from its distance to the middle of the lattice layer
+__device__ __forceinline__ float yo_penalty(float frac) {
+  const float d = fabsf(frac - 0.5f);
+#if TUNE_SCORE_POW == 2
+  return d * d;
+#else
+  return d;
+#endif
+}
+
+#if TUNE_SCORE_MAX
+#define SCORE_COMBINE(a, b) fmaxf((a), (b))
+#else
+#define SCORE_COMBINE(a, b) ((a) + (b))
+#endif
 
 template <OctaveConfig octave_config>
 __device__ float octave_yo_mod1(const XrsrRandomFork &noise_yo_fork) {
@@ -459,7 +476,7 @@ __global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed,
   // Note this inverts the optimisation target. At 0.038 filter_seeds was 64.7%
   // of the run and effectively at its floor; at 0.054 it is 27.6%, while
   // gradvecs_1 (34.5%) and filter_2_01a (24.4%) carry 59% between them.
-  constexpr float maxScore = 0.054f;
+  constexpr float maxScore = TUNE_MAX_SCORE;
 
   // Stack-A accumulator only: with the run 32-aligned, s = S0 ^ j, so the input
   // to mix64(s)'s first multiply is X0 ^ j = P1 + r for r = (X0 & 31) ^ j.
@@ -497,11 +514,17 @@ __global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed,
   uint32_t staged = 0;   // uniform across the warp
 
   const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+#if TUNE_CHAIN_HASH
+  // start_seed is the chain value t of this batch's first seed (see tune.h)
+  uint64_t chain_t = start_seed + (uint64_t)index * N * XrsrRandom::XRSR_GOLDEN_RATIO;
+  uint64_t chain_l = XrsrRandom::mix64(chain_t);
+#else
   const uint64_t base = start_seed + (uint64_t)index * N;
   const uint64_t S0 = base ^ XrsrRandom::XRSR_SILVER_RATIO;
   const uint64_t X0 = S0 ^ (S0 >> 30);
   uint64_t acc_a = (X0 & ~(uint64_t)(N - 1)) * XrsrRandom::XRSR_MIX1;
   const uint64_t C = S0 ^ (X0 & (N - 1));
+#endif
 
 #define OMISSION_DRAIN(ACTIVE)                                                         \
   {                                                                                    \
@@ -515,24 +538,24 @@ __global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed,
       a_yo.hi = (uint64_t)stage[warp][6][lane] | ((uint64_t)stage[warp][7][lane] << 32);\
       const uint64_t seed_ = (uint64_t)stage[warp][8][lane]                            \
                            | ((uint64_t)stage[warp][9][lane] << 32);                    \
-      float sc = 0.35f * fabsf(                                                        \
-          octave_yo_mod1<chosen_continentalness_config.octaves_a[0]>(a_yo) - 0.5f);     \
+      float sc = TUNE_W0 * yo_penalty(                                                \
+          octave_yo_mod1<chosen_continentalness_config.octaves_a[0]>(a_yo));            \
       advance_one(nr);                                                                \
       const auto b_yo = noise_yo_fork(nr.fork());                                       \
-      sc += 0.35f * fabsf(                                                              \
-          octave_yo_mod1<chosen_continentalness_config.octaves_b[0]>(b_yo) - 0.5f);     \
+      sc = SCORE_COMBINE(sc, TUNE_W0 * yo_penalty(                                                       \
+          octave_yo_mod1<chosen_continentalness_config.octaves_b[0]>(b_yo)));            \
       if (sc < maxScore) {                                                              \
-        sc += 0.11f * fabsf(                                                            \
-            octave_yo_mod1<chosen_continentalness_config.octaves_a[1]>(a_yo) - 0.5f);   \
+        sc = SCORE_COMBINE(sc, TUNE_W1 * yo_penalty(                                                     \
+            octave_yo_mod1<chosen_continentalness_config.octaves_a[1]>(a_yo)));          \
         if (sc < maxScore) {                                                            \
-          sc += 0.11f * fabsf(                                                          \
-              octave_yo_mod1<chosen_continentalness_config.octaves_b[1]>(b_yo) - 0.5f); \
+          sc = SCORE_COMBINE(sc, TUNE_W1 * yo_penalty(                                                   \
+              octave_yo_mod1<chosen_continentalness_config.octaves_b[1]>(b_yo)));        \
           if (sc < maxScore) {                                                          \
-            sc += 0.04f * fabsf(                                                        \
-                octave_yo_mod1<chosen_continentalness_config.octaves_a[2]>(a_yo) - 0.5f);\
+            sc = SCORE_COMBINE(sc, TUNE_W2 * yo_penalty(                                                 \
+                octave_yo_mod1<chosen_continentalness_config.octaves_a[2]>(a_yo)));      \
             if (sc < maxScore) {                                                        \
-              sc += 0.04f * fabsf(                                                      \
-                  octave_yo_mod1<chosen_continentalness_config.octaves_b[2]>(b_yo)-0.5f);\
+              sc = SCORE_COMBINE(sc, TUNE_W2 * yo_penalty(                                               \
+                  octave_yo_mod1<chosen_continentalness_config.octaves_b[2]>(b_yo)));    \
               if (sc < maxScore) {                                                      \
                 uint32_t ri = atomicAdd(outputs.len, 1);                                \
                 if (ri < outputs.max_len) { outputs.data[ri] = seed_; }                 \
@@ -544,11 +567,21 @@ __global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed,
     }                                                                                   \
   }
 
+#if TUNE_CHAIN_HASH
+#pragma unroll 2
+  for (uint32_t r = 0; r < N; ++r) {
+    const uint64_t s = chain_t;                                   // s ^ SILVER is the seed
+    chain_t += XrsrRandom::XRSR_GOLDEN_RATIO;
+    const uint64_t l = chain_l;
+    const uint64_t h = XrsrRandom::mix64(chain_t);
+    chain_l = h;                                                  // second word of this seed = first word of the next
+#else
 #pragma unroll 2
   for (uint32_t r = 0; r < N; ++r, acc_a += XrsrRandom::XRSR_MIX1) {
     const uint64_t s = C ^ r;
     const uint64_t l = mix64_finish(acc_a);
     const uint64_t h = XrsrRandom::mix64(s + XrsrRandom::XRSR_GOLDEN_RATIO);
+#endif
 
     const XrsrRandomFork seed_fork = XrsrRandom_seed_fork_from_lh(l, h);
     auto noise_random = seed_fork.from(device_chosen_continentalness_config.fork_hash);
@@ -556,7 +589,7 @@ __global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed,
 
     const float c_0A_yo =
         octave_yo_mod1<chosen_continentalness_config.octaves_a[0]>(noise_a_yo_fork);
-    const bool live = (0.35f * fabsf(c_0A_yo - 0.5f) < maxScore);
+    const bool live = (TUNE_W0 * yo_penalty(c_0A_yo) < maxScore);
 
     const uint32_t mask = __ballot_sync(0xFFFFFFFFu, live);
     const uint32_t slot = staged + __popc(mask & ((1u << lane) - 1u));
@@ -599,7 +632,11 @@ __global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed,
 }
 
 void run(uint64_t start_seed, OutputBuffer<uint64_t> outputs, cudaStream_t stream) {
+#if TUNE_CHAIN_HASH
+  const uint64_t aligned_start = start_seed;   // a chain value; no alignment is needed
+#else
   const uint64_t aligned_start = start_seed & ~(uint64_t)(seeds_per_thread - 1);
+#endif
   constexpr uint32_t launch_threads = threads_per_run / seeds_per_thread;
   kernel<<<launch_threads / threads_per_block, threads_per_block, 0, stream>>>(aligned_start, outputs);
   TRY_CUDA(cudaGetLastError());
@@ -610,6 +647,7 @@ struct SeedPos {
   uint32_t seed_index;
   int32_t x;
   int32_t z;
+  uint32_t aux;   // sample count of the emitting cascade stage; 0 elsewhere
 };
 
 namespace KernelSeed1 {
@@ -626,7 +664,7 @@ namespace KernelSeed1 {
 // tuning above: 0.042 pinned at exactly 65536 survivors an iteration and 0.045
 // pinned harder, so both had their yield truncated and their discovery rate
 // understated, which is what made 0.038 look like the peak.
-constexpr uint32_t threads_per_run = UINT64_C(1) << 19;
+constexpr uint32_t threads_per_run = UINT64_C(1) << TUNE_LOG2_SURVIVORS;
 constexpr uint32_t threads_per_block = 32;
 
 struct Result {
@@ -918,7 +956,7 @@ void init_conv_kernels() {
 //
 // Predicted mean/sd of the score from this decomposition are -34.277 / 4.708;
 // measured over 42630 seeds they are -34.28 / 4.69.
-constexpr float kGradVecs1GateZ0Threshold = -4.0f;
+constexpr float kGradVecs1GateZ0Threshold = TUNE_GV1_Z0_GATE;
 
 // This gate is the hottest read in the program, and it is bound by instruction
 // issue, not by shared-memory bandwidth. The distinction was measured.
@@ -937,10 +975,10 @@ constexpr float kGradVecs1GateZ0Threshold = -4.0f;
 // 8 banks and the kernel turns 54% slower, so the LSU does become the limit
 // there. This sits just on the ALU-bound side of that crossover.
 constexpr float kGradVecs1PrefilterThreshold = -12.0f;
-constexpr float kGradVecs1FinalThreshold      = -16.0047f;  // 8-term score, see above
+constexpr float kGradVecs1FinalThreshold      = TUNE_GV1_FINAL;  // 8-term score, see above
 
-constexpr float kGradVecs2PrefilterThreshold = -13.5f;
-constexpr float kGradVecs2FinalThreshold      = -20.0f;
+constexpr float kGradVecs2PrefilterThreshold = TUNE_GV2_GATE;
+constexpr float kGradVecs2FinalThreshold      = TUNE_GV2_FINAL;
 
 // Layout note: KernelFilterGradVecs1 keeps conv as [256][6]. Consecutive
 // candidates reuse the same permutation index at adjacent columns, so ptxas
@@ -1315,10 +1353,179 @@ void run(
 } // namespace KernelFilterGradVecs1
 
 namespace KernelFilterGradVecs2 {
-constexpr uint32_t block_dim_x = 128;
 constexpr uint32_t grid_width = unbound ? 331 : (large_biomes ? 29 : 115); //checking full bounded world / full unbounded
 constexpr uint32_t threads_per_seed = grid_width * grid_width;
 constexpr uint32_t grid_half = grid_width / 2;
+
+#if TUNE_GV2_BY_COLUMN
+// The score of an image depends on the image only through the lattice cell of stack B it falls in, and that
+// cell is (column of tx, row of tz): the images form a product set.  So one thread takes one column and walks
+// the rows, with its twelve lattice offsets held in registers for the whole walk.  Scanning image by image,
+// every thread rebuilt those offsets for each tx and then used them for two or three images.
+//
+// Unbounded, the 331 images of an axis fall on the 256 lattice columns, one or two to a column, so the
+// 65536 cells are scored once and a passing cell emits each image that lands on it: 109561 image tests
+// become 65536 cell tests.  Bounded, the 115 (or 29) images of an axis are fewer than the columns, so the
+// thread takes an image instead.  The set of candidates passed on is the same either way.
+constexpr bool by_cell = grid_width > 256;
+constexpr uint32_t block_dim_x = by_cell ? 256 : 128;
+constexpr uint32_t max_per_cell = 4;
+static_assert(by_cell || grid_width <= block_dim_x);
+
+__global__
+__launch_bounds__(block_dim_x) void kernel(
+    InputBuffer<SeedPos> inputs,
+    OutputBuffer<SeedPos> outputs,
+    const KernelSeed1::Result* __restrict__ results)
+{
+  __shared__ alignas(16) ImprovedNoise oct_0B;
+  __shared__ alignas(16) float shared_kernel_0B[6][6][16][2];
+
+  __shared__ float conv_z0[6][256];
+  __shared__ float conv_z1[6][256];
+
+  // [axis][image]: lattice column (axis 0) or row (axis 1) of stack B the image falls in
+  __shared__ uint8_t img_cell[2][by_cell ? 336 : 128];
+  // [axis][cell]: how many images fall in the cell, and which
+  __shared__ uint32_t cell_n[2][by_cell ? 256 : 1];
+  __shared__ uint16_t cell_img[2][by_cell ? 256 : 1][max_per_cell];
+
+  for (uint32_t i = threadIdx.x; i < 288; i += blockDim.x) {
+    reinterpret_cast<uint4*>(shared_kernel_0B)[i] =
+        reinterpret_cast<const uint4*>(device_kernel_0B)[i];
+  }
+
+  constexpr int32_t cell_size_0A = (int32_t)(1.0f / chosen_continentalness_config.octaves_a[0].input_factor) * 256;
+  const float input_factor_b = chosen_continentalness_config.octaves_b[0].input_factor;
+  const int32_t grid_half_s = (int32_t)grid_half;
+
+  const uint32_t inputs_len = *inputs.len;
+  for (uint32_t input_index = blockIdx.x; input_index < inputs_len; input_index += gridDim.x) {
+    const SeedPos input = inputs.data[input_index];
+
+    __syncthreads();
+
+    if (threadIdx.x < 17) {
+      reinterpret_cast<uint4*>(&oct_0B)[threadIdx.x] =
+          reinterpret_cast<const uint4*>(&results[input.seed_index].continentalness_0B)[threadIdx.x];
+    }
+    if constexpr (by_cell) {
+      cell_n[0][threadIdx.x] = 0;
+      cell_n[1][threadIdx.x] = 0;
+    }
+
+    __syncthreads();
+
+    for (int32_t V = threadIdx.x; V < 256; V += blockDim.x) {
+      uint32_t p_z[6];
+#pragma unroll
+      for (int32_t dnz = 0; dnz < 6; ++dnz) {
+        p_z[dnz] = oct_0B.p[(V + dnz) & 0xFF] & 0xF;
+      }
+
+#pragma unroll
+      for (int32_t dnx = 0; dnx < 6; ++dnx) {
+        float conv0 = 0.0f;
+        float conv1 = 0.0f;
+
+#pragma unroll
+        for (int32_t dnz = 0; dnz < 6; ++dnz) {
+          const uint32_t p = p_z[dnz];
+          conv0 += shared_kernel_0B[dnx][dnz][p][0];
+          conv1 += shared_kernel_0B[dnx][dnz][p][1];
+        }
+
+        conv_z0[dnx][V] = conv0;
+        conv_z1[dnx][V] = conv1;
+      }
+    }
+
+    for (uint32_t t = threadIdx.x; t < grid_width; t += blockDim.x) {
+      const int32_t tile_d = ((int32_t)t - grid_half_s) * cell_size_0A;
+      const int32_t cx = __float2int_rd((input.x + tile_d) * input_factor_b + oct_0B.xo - 2.0f) & 0xFF;
+      const int32_t cz = __float2int_rd((input.z + tile_d) * input_factor_b + oct_0B.zo - 2.0f) & 0xFF;
+      img_cell[0][t] = (uint8_t)cx;
+      img_cell[1][t] = (uint8_t)cz;
+      if constexpr (by_cell) {
+        const uint32_t sx = atomicAdd(&cell_n[0][cx], 1u);
+        if (sx < max_per_cell) { cell_img[0][cx][sx] = (uint16_t)t; }
+        const uint32_t sz = atomicAdd(&cell_n[1][cz], 1u);
+        if (sz < max_per_cell) { cell_img[1][cz][sz] = (uint16_t)t; }
+      }
+    }
+
+    __syncthreads();
+
+    const int32_t ny = oct_0B.yo;
+
+    // this thread's column: a lattice column (by cell) or the column of image tx = threadIdx.x
+    uint32_t n_x = 1;
+    int32_t col = 0;
+    if constexpr (by_cell) {
+      n_x = cell_n[0][threadIdx.x];
+      if (n_x > max_per_cell) { n_x = max_per_cell; }
+      col = (int32_t)threadIdx.x;
+    } else {
+      if (threadIdx.x >= grid_width) { n_x = 0; }
+      else { col = img_cell[0][threadIdx.x]; }
+    }
+
+    if (n_x != 0) {
+      int32_t hoisted_idx_xy[2][6];
+#pragma unroll
+      for (int32_t dnx = 0; dnx < 6; ++dnx) {
+        const int32_t idx_x = oct_0B.p[(col + dnx) & 0xFF];
+#pragma unroll
+        for (int32_t dny = 0; dny < 2; ++dny) {
+          hoisted_idx_xy[dny][dnx] = oct_0B.p[(idx_x + ny + dny) & 0xFF];
+        }
+      }
+
+      constexpr uint32_t rows = by_cell ? 256u : grid_width;
+      for (uint32_t r = 0; r < rows; ++r) {
+        uint32_t n_z = 1;
+        int32_t row;
+        if constexpr (by_cell) {
+          n_z = cell_n[1][r];
+          if (n_z > max_per_cell) { n_z = max_per_cell; }
+          row = (int32_t)r;
+        } else {
+          row = img_cell[1][r];
+        }
+        if (n_z == 0) { continue; }
+
+        int32_t idx0[6];
+        int32_t idx1[6];
+#pragma unroll
+        for (int32_t i = 0; i < 6; ++i) {
+          idx0[i] = hoisted_idx_xy[0][i] + row;
+          idx1[i] = hoisted_idx_xy[1][i] + row;
+        }
+
+        const float gate = score_center_2x2_t(conv_z0, conv_z1, idx0, idx1);
+        if (gate >= kGradVecs2PrefilterThreshold) {
+          const float score = score_full_12_t(conv_z0, conv_z1, idx0, idx1);
+          if (score > kGradVecs2FinalThreshold) {
+            for (uint32_t a = 0; a < n_x; ++a) {
+              const uint32_t tx = by_cell ? (uint32_t)cell_img[0][by_cell ? threadIdx.x : 0][a] : threadIdx.x;
+              const int32_t x = input.x + ((int32_t)tx - grid_half_s) * cell_size_0A;
+              for (uint32_t b = 0; b < n_z; ++b) {
+                const uint32_t tz = by_cell ? (uint32_t)cell_img[1][by_cell ? r : 0][b] : r;
+                const int32_t z = input.z + ((int32_t)tz - grid_half_s) * cell_size_0A;
+                uint32_t result_index = atomicAdd(outputs.len, 1);
+                if (result_index < outputs.max_len) {
+                  outputs.data[result_index] = {input.seed_index, x, z};
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+#else
+constexpr uint32_t block_dim_x = 128;
 
 __global__
 __launch_bounds__(block_dim_x) void kernel(
@@ -1426,6 +1633,8 @@ __launch_bounds__(block_dim_x) void kernel(
     }
   }
 }
+
+#endif
 
 void run(
     const InputBuffer<SeedPos> inputs,
@@ -1652,7 +1861,7 @@ __global__ __launch_bounds__(T::threads_per_block) void kernel(InputBuffer<SeedP
       if (pos_index == 0) {
         uint32_t result_index = atomicAdd(outputs.len, 1);
         if (result_index < outputs.max_len) {
-          outputs.data[result_index] = {input.seed_index, input.x + sum_dx, input.z + sum_dz};
+          outputs.data[result_index] = {input.seed_index, input.x + sum_dx, input.z + sum_dz, total_valid};
         }
       }
     }
@@ -1677,7 +1886,7 @@ void Template<NoiseThreshold, Octaves, PosRange, Samples, MinCount, FlippedSpars
 
 // cactus was here :)
 namespace KernelFilter2_0A {
-using T = KernelFilter2::Template<-5500, 3, 8 * 1024, 256, 27, false, false, true>;
+using T = KernelFilter2::Template<-5500, 3, 8 * 1024, 256, TUNE_A_MIN, false, false, true>;
 
 static_assert(T::samples == 256);
 static_assert(T::samples_square_size == 16);
@@ -1933,7 +2142,7 @@ void run(InputBuffer<SeedPos> inputs, OutputBuffer<SeedPos> outputs, KernelSeed1
 } // namespace KernelFilter2_0A
 
 namespace KernelFilter2_0B {
-using T = KernelFilter2::Template<-5500, 3, 8 * 1024, 256, 20, false, false, false>;
+using T = KernelFilter2::Template<-5500, 3, 8 * 1024, 256, TUNE_B_MIN, false, false, false>;
 
 static_assert(T::samples == 256);
 static_assert(T::samples_square_size == 16);
@@ -2280,6 +2489,16 @@ void GpuThread::run() {
   TRY_CUDA(cudaMalloc(&device_buffer_lens, sizeof(*device_buffer_lens)));
 
   std::printf("Running device %d\n", device);
+  std::printf("tune: chain_hash %d  log2 batch %d survivors %d\n", TUNE_CHAIN_HASH, TUNE_LOG2_BATCH, TUNE_LOG2_SURVIVORS);
+  std::printf("tune: score weights %g %g %g pow %d combine %s\n", (double)TUNE_W0, (double)TUNE_W1, (double)TUNE_W2, TUNE_SCORE_POW, TUNE_SCORE_MAX ? "max" : "sum");
+  std::printf("tune: max_score %g  gv1 z0 %g final %g  gv2 %g/%g  a_min %d b_min %d  cascade %d %d %d %d\n",
+              (double)TUNE_MAX_SCORE, (double)TUNE_GV1_Z0_GATE, (double)TUNE_GV1_FINAL, (double)TUNE_GV2_GATE, (double)TUNE_GV2_FINAL,
+              TUNE_A_MIN, TUNE_B_MIN, TUNE_MIN_2A, TUNE_MIN_2B, TUNE_MIN_2C, TUNE_MIN_2D);
+#if TUNE_LOG_CANDIDATES
+  std::FILE *cand_file = std::fopen((std::string("candidates-dev") + std::to_string(device) + ".txt").c_str(), "a");
+#else
+  std::FILE *cand_file = nullptr;
+#endif
 
   DeviceBuffer buffer_seeds(sizeof(uint64_t) * KernelSeed1::threads_per_run);
   DeviceBuffer buffer_results(sizeof(KernelSeed1::Result) * KernelSeed1::threads_per_run);
@@ -2329,10 +2548,10 @@ void GpuThread::run() {
   Kernel2RunFunc filter_2_0B_run = KernelFilter2_0B::run;
 
   Kernel2RunFunc filter_2_runs[] = {
-      KernelFilter2::Template<-10500, 12, 8 * 1024, 256, 24, false, true, false>::run, 
-      KernelFilter2::Template<-10500, 14, 8 * 1024, 1024, 110, false, true, false>::run,
-      KernelFilter2::Template<-10500, 16, 10 * 1024, 4096, 340, false, false, false>::run,
-      KernelFilter2::Template<-10500, 18, 10 * 1024, 16384, 1540, false, false, false>::run, // zajonc was here :D, use 1600 instead of 1540 because of colab shitty cpus
+      KernelFilter2::Template<-10500, 12, 8 * 1024, 256, TUNE_MIN_2A, false, true, false>::run, 
+      KernelFilter2::Template<-10500, 14, 8 * 1024, 1024, TUNE_MIN_2B, false, true, false>::run,
+      KernelFilter2::Template<-10500, 16, 10 * 1024, 4096, TUNE_MIN_2C, false, false, false>::run,
+      KernelFilter2::Template<-10500, 18, 10 * 1024, 16384, TUNE_MIN_2D, false, false, false>::run, // zajonc was here :D, use 1600 instead of 1540 because of colab shitty cpus
   };
   std::vector<Filter2Stage> filter_2;
   {
@@ -2356,12 +2575,19 @@ void GpuThread::run() {
 
   for (uint32_t i = 0; !should_stop() && (!benchmark || i < PRINT_INTERVAL); i++) {
     uint64_t start_seed = input.next(KernelFilterSeeds::threads_per_run);
+#if TUNE_CHAIN_HASH
+    // position in the scan -> chain value of the batch's first seed
+    const uint64_t batch_start = (input.origin ^ XrsrRandom::XRSR_SILVER_RATIO)
+                               + (start_seed - input.origin) * XrsrRandom::XRSR_GOLDEN_RATIO;
+#else
+    const uint64_t batch_start = start_seed;
+#endif
 
     TRY_CUDA(cudaMemsetAsync(device_buffer_lens, 0, sizeof(*device_buffer_lens), stream));
 
     event_start.record(stream);
 
-    KernelFilterSeeds::run(start_seed, outputs_filter_seeds, stream);
+    KernelFilterSeeds::run(batch_start, outputs_filter_seeds, stream);
     stage_filter_seeds.record(stream);
 
     KernelSeed1::kernel<<<KernelSeed1::threads_per_run / KernelSeed1::threads_per_block, KernelSeed1::threads_per_block, 0, stream>>>(outputs_filter_seeds, results);
@@ -2481,8 +2707,10 @@ void GpuThread::run() {
           uint64_t seed;
           TRY_CUDA(cudaMemcpy(&seed, &outputs_filter_seeds.data[result.seed_index], sizeof(seed), cudaMemcpyDeviceToHost));
           outputs.queue.push({seed, result.x * 4, result.z * 4});
+          if (cand_file) std::fprintf(cand_file, "%" PRIi64 " %d %d %u\n", (int64_t)seed, result.x * 4, result.z * 4, result.aux);
         }
       }
+      if (cand_file) std::fflush(cand_file);
     }
 
     if ((i + 1) % PRINT_INTERVAL == 0) {
@@ -2553,6 +2781,7 @@ void GpuThread::run() {
     running.store(false, std::memory_order_relaxed);
   }
 
+  if (cand_file) std::fclose(cand_file);
   TRY_CUDA(cudaStreamDestroy(stream));
   TRY_CUDA(cudaFree(device_buffer_lens));
 }

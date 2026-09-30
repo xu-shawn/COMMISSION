@@ -4,8 +4,9 @@
 
 struct SeedIterator {
     std::atomic_uint64_t pos;
+    const uint64_t origin;   // the --start seed: position 0 of the scan
 
-    SeedIterator(uint64_t start) : pos(start) {
+    SeedIterator(uint64_t start) : pos(start), origin(start) {
 
     }
 
