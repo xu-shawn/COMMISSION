@@ -104,6 +104,8 @@ struct Args {
     std::optional<std::string> output_file;
     std::optional<int64_t> start_seed;
     std::optional<int32_t> min_size;
+    std::optional<int64_t> origin;
+    std::optional<int64_t> iters;
     bool benchmark = false;
 
     bool parse(int argc, const char **const argv) {
@@ -154,6 +156,10 @@ struct Args {
                 if (!parse_argument_int(argc, argv, i, start_seed, [](int64_t start_seed){ return true; }, arg)) return false;
             } else if (std::strcmp("--size", arg) == 0) {
                 if (!parse_argument_int(argc, argv, i, min_size, [](int32_t min_size){ return min_size >= 0; }, arg)) return false;
+            } else if (std::strcmp("--origin", arg) == 0) {
+                if (!parse_argument_int(argc, argv, i, origin, [](int64_t){ return true; }, arg)) return false;
+            } else if (std::strcmp("--iters", arg) == 0) {
+                if (!parse_argument_int(argc, argv, i, iters, [](int64_t n){ return n >= 1; }, arg)) return false;
             } else if (std::strcmp("--benchmark", arg) == 0) {
                 if (check_duplicate(benchmark, arg)) return false;
                 benchmark = true;
@@ -199,7 +205,7 @@ uint64_t random_start_seed() {
 int main_inner(int argc, char **argv) {
     Args args{};
     if (!args.parse(argc, const_cast<const char **const>(argv))) {
-        std::fprintf(stderr, "Usage:\n%s [--device <device>,<device>,...] [--threads <threads>] [--client <server_address>] [--server <listen_address>] [--output <output_file>] [--start <start_seed>] [--size <min_size>] [--benchmark]\n", argv[0]);
+        std::fprintf(stderr, "Usage:\n%s [--device <device>,<device>,...] [--threads <threads>] [--client <server_address>] [--server <listen_address>] [--output <output_file>] [--start <start_seed>] [--origin <seed>] [--iters <batches>] [--size <min_size>] [--benchmark]\n", argv[0]);
         return 1;
     }
 
@@ -241,11 +247,14 @@ int main_inner(int argc, char **argv) {
 
 #ifndef NO_GPU
     uint64_t start_seed = args.start_seed.value_or(random_start_seed());
-    SeedIterator seed_range(start_seed);
+    // --origin fixes position 0 of the seed order, so runs with one origin and different --start values scan
+    // disjoint stretches of the same sequence (chunked searches). Without it the order starts at --start.
+    SeedIterator seed_range(start_seed, (uint64_t)args.origin.value_or((int64_t)start_seed));
+    const uint64_t max_iters = args.iters ? (uint64_t)*args.iters : (args.benchmark ? PRINT_INTERVAL : 0);
 
     std::vector<std::unique_ptr<GpuThread>> gpu_threads;
     for (int device : args.devices) {
-        gpu_threads.emplace_back(std::make_unique<GpuThread>(device, std::ref(seed_range), std::ref(gpu_outputs), args.benchmark, running));
+        gpu_threads.emplace_back(std::make_unique<GpuThread>(device, std::ref(seed_range), std::ref(gpu_outputs), max_iters, running));
     }
     if (!gpu_threads.empty()) {
         std::printf("Starting from %" PRIi64 "\n", start_seed);
@@ -274,7 +283,7 @@ int main_inner(int argc, char **argv) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
-    for (size_t i = 0; running.load(std::memory_order_relaxed) && (!args.benchmark || i < PRINT_INTERVAL); i++) {
+    for (size_t i = 0; running.load(std::memory_order_relaxed); i++) {
         if (threads != 0) {
             std::lock_guard lock(cpu_outputs.mutex);
             while (!cpu_outputs.queue.empty()) {

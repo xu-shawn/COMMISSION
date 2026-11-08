@@ -195,3 +195,24 @@
 #ifndef TUNE_JOINT_LEVEL
 #define TUNE_JOINT_LEVEL -1.05
 #endif
+
+// gradvecs_1 scanned with candidates on the lanes and columns in the loop (kernel_v2): same candidates,
+// conflict-free table reads.
+#ifndef TUNE_GV1_V2
+#define TUNE_GV1_V2 0
+#endif
+
+// timing experiments on kernel_v2 only (wrong results): 1 = setup without scan, 2 = scan without queue/score
+#ifndef TUNE_GV1_EXP
+#define TUNE_GV1_EXP 0
+#endif
+
+// The joint test reuses filter_2_01a's octave 0A + 1A sums instead of recomputing them at every image.
+#ifndef TUNE_JOINT_REUSE_A
+#define TUNE_JOINT_REUSE_A 0
+#endif
+
+// mix64 multipliers of the seed hashing passed as kernel arguments (Pascal: avoids MOV32I per seed). Same results.
+#ifndef TUNE_HASH_KARG
+#define TUNE_HASH_KARG 0
+#endif
