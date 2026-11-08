@@ -33,6 +33,34 @@
 #  ifndef TUNE_LOG2_BATCH
 #    define TUNE_LOG2_BATCH 30
 #  endif
+// Size-aware thresholds (docs/record-tuning.md). gradvecs_1's z0 gate looks at the bottom layer of the
+// central lattice nodes only and drops ~40% of large islands; -5 keeps most of them. Its final score, raised
+// from -16 to -15, drops a tenth of 9-10M islands but only ~7% of those above 11M (their octave-0 cores are
+// stronger), and cuts the positions handed to filter_2_01a by 2.5x.
+#  ifndef TUNE_GV1_Z0_GATE
+#    define TUNE_GV1_Z0_GATE -5.0f
+#  endif
+#  ifndef TUNE_GV1_FINAL
+#    define TUNE_GV1_FINAL -15.0f
+#  endif
+// filter_2_01b replaced by the joint octave 0-1 test (both stacks), which keeps every known island above
+// 10.5M and passes about a fortieth of what the B-only test did
+#  ifndef TUNE_JOINT_B
+#    define TUNE_JOINT_B 24
+#  endif
+// seed hashing overlapped with the later kernels, and the hashing's zero-state guard skipped (same results)
+#  ifndef TUNE_RAW_FORK
+#    define TUNE_RAW_FORK 1
+#  endif
+#  ifndef TUNE_OVERLAP
+#    define TUNE_OVERLAP 1
+#  endif
+#  ifndef TUNE_GV1_BPS
+#    define TUNE_GV1_BPS 2
+#  endif
+#  ifndef TUNE_A_BPS
+#    define TUNE_A_BPS 3
+#  endif
 // hand the CPU only candidates whose estimated area is at least 10.9 million blocks
 #  ifndef TUNE_MIN_2B
 #    define TUNE_MIN_2B 140
@@ -135,4 +163,35 @@
 // count is the final stage's sample count (estimated area = count * 6400).  Off by default.
 #ifndef TUNE_LOG_CANDIDATES
 #define TUNE_LOG_CANDIDATES 0
+#endif
+
+// ---- additions (see docs/record-tuning.md) ----------------------------------------------------------------
+
+// Skip the all-zero-state guard of XrsrRandom(lo, hi) in the seed hashing (probability 2^-128). Same results.
+#ifndef TUNE_RAW_FORK
+#define TUNE_RAW_FORK 0
+#endif
+
+// Hash batch i+1 on a low-priority stream while batch i runs through the later kernels on a high-priority one
+// (seed hashing is bound by the integer ALU pipe, gradvecs_1 by shared-memory loads). Same results.
+#ifndef TUNE_OVERLAP
+#define TUNE_OVERLAP 0
+#endif
+
+// Grid caps, in blocks per SM, for gradvecs_1 and filter_2_01a (0 = the fixed grids used before). With
+// TUNE_OVERLAP they leave room on each SM for the hashing blocks.
+#ifndef TUNE_GV1_BPS
+#define TUNE_GV1_BPS 0
+#endif
+#ifndef TUNE_A_BPS
+#define TUNE_A_BPS 0
+#endif
+
+// filter_2_01b replaced by a joint test on octaves 0-1 of both stacks: the minimum number of the 256 samples
+// where 0A + 0B + 1A + 1B < TUNE_JOINT_LEVEL (0 = the B-only test).
+#ifndef TUNE_JOINT_B
+#define TUNE_JOINT_B 0
+#endif
+#ifndef TUNE_JOINT_LEVEL
+#define TUNE_JOINT_LEVEL -1.05
 #endif

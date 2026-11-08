@@ -14,10 +14,10 @@ CUDA app that uses various clever tricks to produce mushroom islands of adequate
 
 ## Record search build (`PRESET=record`)
 
-This branch adds a tuned build for hunting islands of 11 million blocks and more. On identical seeds it finds
-as many large islands per seed as the unmodified program and scans about 2.3× as many seeds per second
-(bounded, RTX 4080 Super: 22.6 → 54.5 G seeds/s). Every threshold is a macro in `src/tune.h`; a plain
-`make` still searches exactly as before.
+This branch adds a tuned build for hunting islands of 11 million blocks and more. It finds about 1.5× the
+record-size islands per GPU-hour of the first version of this preset, and about 3× those of the unmodified
+program. Every threshold is a macro in `src/tune.h`; a plain `make` still searches exactly as before, except for
+a buffer race fixed in all builds.
 
 ```sh
 make PRESET=record                 # bounded small biomes   -> main-sb-record
@@ -28,14 +28,15 @@ make PRESET=record UNBOUND=1       # unbounded small biomes -> main-sbu-record
 - The preset only hands the CPU candidates estimated at 10.9M blocks and more, so use `--size 11000000`
   (or at least 10,700,000). For smaller islands use the plain build.
 - Give every machine its own `--start`. Two runs with the same start scan the same seeds in the same order.
-- Speeds, bounded, G seeds per second: RTX 5090 120, RTX 4090 95, RTX 5080 66, RTX 4080 Super 56,
-  RTX 4070 Ti Super 49, RTX 5070 39, RTX 4060 Ti 25, RTX 3080 25, RTX 3060 Ti 19. Two cards give twice one.
-- Islands above 11M appear at about 0.8 per 10¹⁵ bounded seeds and thin out by e per 0.3M of size, so an
-  island above the current bounded record (12,618,448) takes about 2.4 × 10¹⁷ seeds (68% range
-  1.1–5.3 × 10¹⁷): about 30 days of one RTX 4090 at 95 G seeds/s, or roughly $230 of rented GPUs.
+- Bounded, RTX 4080 Super: 64 G seeds/s. Seeds per second are no longer comparable with other builds, since
+  the thresholds decide how many islands a seed yields.
+- An island above the current bounded record (12,618,448) takes about 22 days of one RTX 4080 Super, or
+  14 of an RTX 4090, give or take a factor of 2. That is about $120 on-demand.
+- What makes an island large, the size-dependent thresholds and the measurements are in
+  `docs/record-tuning.md`; the first round of tuning is in `docs/search-economics.md`. `tools/` has the
+  verification program and `tools/analysis/` the analysis programs, including a CPU port of the pipeline.
 - The preset was validated for small biomes only. The branch also fixes an overflow that made the
   large-biomes CPU pre-test accept every candidate.
-- `docs/search-economics.md` has the measurements; `tools/` has the verification and analysis programs.
 - Prebuilt Linux binaries were built with `NVCC_FLAGS="--cudart static"` on CUDA 12.4 and need driver 550
   or newer: `sm_86` for the 30 series, `sm_89` for the 40 and 50 series, `sm_75` for the 20 series.
 

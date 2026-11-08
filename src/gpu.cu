@@ -584,7 +584,15 @@ __global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed,
 #endif
 
     const XrsrRandomFork seed_fork = XrsrRandom_seed_fork_from_lh(l, h);
+#if TUNE_RAW_FORK
+    // XrsrRandom(lo, hi) replaces an all-zero state by a constant, which costs six ALU instructions a seed in
+    // a kernel bound by ALU issue (7% of it); here the state is all zero with probability 2^-128.
+    XrsrRandom noise_random;
+    noise_random.lo = seed_fork.lo ^ device_chosen_continentalness_config.fork_hash.lo;
+    noise_random.hi = seed_fork.hi ^ device_chosen_continentalness_config.fork_hash.hi;
+#else
     auto noise_random = seed_fork.from(device_chosen_continentalness_config.fork_hash);
+#endif
     const auto noise_a_yo_fork = noise_yo_fork(fork_short(noise_random));
 
     const float c_0A_yo =
@@ -642,6 +650,14 @@ void run(uint64_t start_seed, OutputBuffer<uint64_t> outputs, cudaStream_t strea
   TRY_CUDA(cudaGetLastError());
 }
 } // namespace KernelFilterSeeds
+
+// multiprocessor count of the current device, for grids sized per SM
+static int device_sms() {
+  int dev = 0, n = 0;
+  TRY_CUDA(cudaGetDevice(&dev));
+  TRY_CUDA(cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev));
+  return n;
+}
 
 struct SeedPos {
   uint32_t seed_index;
@@ -1347,7 +1363,10 @@ void run(
   // the queue of work available to hide the per-seed global load and the
   // barriers around the convolution build. Measured -1.9% on this stage; 8192
   // measures the same and 1024 is 2.7% worse.
-  kernel<<<4096, block_dim_x, 0, stream>>>(seeds, outputs, results);
+  // TUNE_GV1_BPS > 0 caps the grid at that many blocks per SM, which leaves room on every SM for blocks of the
+  // seed hashing running beside it (TUNE_OVERLAP)
+  static const int blocks = TUNE_GV1_BPS > 0 ? device_sms() * TUNE_GV1_BPS : 4096;
+  kernel<<<blocks, block_dim_x, 0, stream>>>(seeds, outputs, results);
   TRY_CUDA(cudaGetLastError());
 }
 } // namespace KernelFilterGradVecs1
@@ -2136,7 +2155,8 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos>
 }
 
 void run(InputBuffer<SeedPos> inputs, OutputBuffer<SeedPos> outputs, KernelSeed1::Result *results, cudaStream_t stream) {
-  kernel<<<32 * 256, threads_per_block, 0, stream>>>(inputs, outputs, results);
+  static const int blocks = TUNE_A_BPS > 0 ? device_sms() * TUNE_A_BPS : 32 * 256;
+  kernel<<<blocks, threads_per_block, 0, stream>>>(inputs, outputs, results);
   TRY_CUDA(cudaGetLastError());
 }
 } // namespace KernelFilter2_0A
@@ -2363,8 +2383,105 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos>
   }
 }
 
+#if TUNE_JOINT_B
+// Joint replacement for the B-side test. Everything before gradvecs_2 sees one noise stack at a time, and on
+// its own each stack's octaves 0-1 say little about how large an island becomes; together they do. On the same
+// 16x16 grid this counts the samples where octaves 0A + 0B + 1A + 1B are already below TUNE_JOINT_LEVEL.
+// Measured against 61 islands of 11M and more, 700 of 8-10.5M and 25,000 gradvecs_2 outputs: at -1.05 and a
+// count of 28, it keeps nearly every large island, three fifths of the 8-10.5M ones, and none of the 25,000.
+// one octave's contribution at 8 consecutive x samples (pos_step apart) of one z row, added to vals
+template <OctaveConfig cfg>
+__device__ __forceinline__ void joint_octave(const GradDotTable &table, const ImprovedNoise &oct, int32_t x_base, int32_t z, float (&vals)[8]) {
+  constexpr float inf = (float)cfg.input_factor, vf = (float)cfg.value_factor;
+  const float y = oct.yo;
+  const int32_t int_y = __float2int_rd(y);
+  const float frac_y = y - (float)int_y, fy = smoothstep(frac_y);
+  const float zc = z * inf + oct.zo;
+  const int32_t int_z = __float2int_rd(zc);
+  const float frac_z = zc - (float)int_z, fz = smoothstep(frac_z);
+  int32_t cur = 0; bool have = false;
+  float ga, ba, gb, bb;
+#pragma unroll
+  for (uint32_t k = 0; k < 8; k++) {
+    const float xc = (x_base + (int32_t)(k * T::pos_step)) * inf + oct.xo;
+    const int32_t ix = __float2int_rd(xc);
+    const float fx = xc - (float)ix;
+    if (!have || ix != cur) {
+      if (have && ix == cur + 1) {
+        ga = gb; ba = bb;
+        face_coeffs(table, oct, oct.p[(ix + 1) & 0xFF], int_y, int_z, frac_y, frac_z, fy, fz, gb, bb);
+      } else {
+        cell_coeffs(table, oct, ix, int_y, int_z, frac_y, frac_z, fy, fz, ga, ba, gb, bb);
+      }
+      cur = ix; have = true;
+    }
+    vals[k] += cell_sample(fx, smoothstep(fx), ga, ba, gb, bb) * vf;
+  }
+}
+
+__global__ __launch_bounds__(threads_per_block) void joint_kernel(InputBuffer<SeedPos> inputs, OutputBuffer<SeedPos> outputs, KernelSeed1::Result *results) {
+  __shared__ GradDotTable shared_grad_dot_table;
+  __shared__ ImprovedNoise s_oct[warps_per_block][4];
+
+  for (uint32_t i = threadIdx.x; i < sizeof(shared_grad_dot_table) / sizeof(uint32_t); i += threads_per_block) {
+    reinterpret_cast<uint32_t *>(&shared_grad_dot_table)[i] = reinterpret_cast<uint32_t *>(&device_grad_dot_table)[i];
+  }
+  __syncthreads();
+
+  const uint32_t lane = threadIdx.x & 31u;
+  const uint32_t warp_in_block = threadIdx.x >> 5;
+  const uint32_t warp_global = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const uint32_t num_warps = (gridDim.x * blockDim.x) >> 5;
+  const uint32_t z_index = lane >> 1;
+  const uint32_t x_start = (lane & 1u) * 8u;
+  constexpr uint32_t words = sizeof(ImprovedNoise) / sizeof(uint32_t);
+
+  const uint32_t inputs_len = *inputs.len;
+  for (uint32_t input_index = warp_global; input_index < inputs_len; input_index += num_warps) {
+    const SeedPos input = inputs.data[input_index];
+    const KernelSeed1::Result &res = results[input.seed_index];
+    {
+      const uint32_t *src[4] = {reinterpret_cast<const uint32_t *>(&res.continentalness_0A), reinterpret_cast<const uint32_t *>(&res.continentalness_0B),
+                                reinterpret_cast<const uint32_t *>(&res.continentalness_1A), reinterpret_cast<const uint32_t *>(&res.continentalness_1B)};
+#pragma unroll
+      for (uint32_t o = 0; o < 4; o++) {
+        uint32_t *dst = reinterpret_cast<uint32_t *>(&s_oct[warp_in_block][o]);
+        for (uint32_t i = lane; i < words; i += 32) { dst[i] = src[o][i]; }
+      }
+    }
+    __syncwarp();
+
+    const int32_t z = input.z + (int32_t)(z_index * T::pos_step) + T::pos_offset;
+    const int32_t x_base = input.x + (int32_t)(x_start * T::pos_step) + T::pos_offset;
+    // Each lane walks 8 consecutive samples along x. Per octave the y and z setup is fixed for the lane, and a
+    // step of a quarter (octave 0) or a half (octave 1) of a lattice cell keeps or advances the x cell, so the
+    // cell's coefficients are cached and a new cell reuses the previous right face (as in filter_2_01a/b).
+    float vals[8] = {};
+    joint_octave<chosen_continentalness_config.octaves_a[0]>(shared_grad_dot_table, s_oct[warp_in_block][0], x_base, z, vals);
+    joint_octave<chosen_continentalness_config.octaves_b[0]>(shared_grad_dot_table, s_oct[warp_in_block][1], x_base, z, vals);
+    joint_octave<chosen_continentalness_config.octaves_a[1]>(shared_grad_dot_table, s_oct[warp_in_block][2], x_base, z, vals);
+    joint_octave<chosen_continentalness_config.octaves_b[1]>(shared_grad_dot_table, s_oct[warp_in_block][3], x_base, z, vals);
+    uint32_t local_count = 0;
+#pragma unroll
+    for (uint32_t k = 0; k < 8; k++) { local_count += (vals[k] < (float)TUNE_JOINT_LEVEL) ? 1u : 0u; }
+    const uint32_t total = warp_reduce_add(local_count);
+    if (lane == 0 && total >= TUNE_JOINT_B) {
+      uint32_t result_index = atomicAdd(outputs.len, 1);
+      if (result_index < outputs.max_len) {
+        outputs.data[result_index] = {input.seed_index, input.x, input.z};
+      }
+    }
+    __syncwarp();
+  }
+}
+#endif
+
 void run(InputBuffer<SeedPos> inputs, OutputBuffer<SeedPos> outputs, KernelSeed1::Result *results, cudaStream_t stream) {
+#if TUNE_JOINT_B
+  joint_kernel<<<32 * 256, threads_per_block, 0, stream>>>(inputs, outputs, results);
+#else
   kernel<<<32 * 256, threads_per_block, 0, stream>>>(inputs, outputs, results);
+#endif
   TRY_CUDA(cudaGetLastError());
 }
 } // namespace KernelFilter2_0B
@@ -2482,7 +2599,21 @@ void GpuThread::run() {
   init_conv_kernels();
 
   cudaStream_t stream;
+#if TUNE_OVERLAP
+  // Seed hashing is bound by the integer ALU pipe; gradvecs_1 by shared-memory loads and filter_2_01a by
+  // float work. Run on one stream they take turns; here the hashing of batch i+1 runs on a low-priority
+  // stream while everything after it for batch i runs on a high-priority one, so an SM holds blocks of both
+  // and their bottlenecks overlap. The survivor list is double-buffered; nothing else is shared.
+  cudaStream_t hstream;
+  {
+    int prio_low, prio_high;
+    TRY_CUDA(cudaDeviceGetStreamPriorityRange(&prio_low, &prio_high));
+    TRY_CUDA(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, prio_high));
+    TRY_CUDA(cudaStreamCreateWithPriority(&hstream, cudaStreamNonBlocking, prio_low));
+  }
+#else
   TRY_CUDA(cudaStreamCreate(&stream));
+#endif
 
   BufferLens host_buffer_lens;
   BufferLens *device_buffer_lens;
@@ -2494,6 +2625,8 @@ void GpuThread::run() {
   std::printf("tune: max_score %g  gv1 z0 %g final %g  gv2 %g/%g  a_min %d b_min %d  cascade %d %d %d %d\n",
               (double)TUNE_MAX_SCORE, (double)TUNE_GV1_Z0_GATE, (double)TUNE_GV1_FINAL, (double)TUNE_GV2_GATE, (double)TUNE_GV2_FINAL,
               TUNE_A_MIN, TUNE_B_MIN, TUNE_MIN_2A, TUNE_MIN_2B, TUNE_MIN_2C, TUNE_MIN_2D);
+  std::printf("tune: joint_b %d (level %g)  raw_fork %d  overlap %d  grid caps gv1 %d a %d per SM\n",
+              TUNE_JOINT_B, (double)TUNE_JOINT_LEVEL, TUNE_RAW_FORK, TUNE_OVERLAP, TUNE_GV1_BPS, TUNE_A_BPS);
 #if TUNE_LOG_CANDIDATES
   std::FILE *cand_file = std::fopen((std::string("candidates-dev") + std::to_string(device) + ".txt").c_str(), "a");
 #else
@@ -2514,6 +2647,13 @@ void GpuThread::run() {
   CudaEventWrapper event_start;
 
   OutputBuffer<uint64_t> outputs_filter_seeds(buffer_seeds, &device_buffer_lens->results_len_filter_seeds);
+#if TUNE_OVERLAP
+  DeviceBuffer buffer_seeds_2(sizeof(uint64_t) * KernelSeed1::threads_per_run);
+  DeviceBuffer seed_lens(2 * sizeof(uint32_t));
+  OutputBuffer<uint64_t> seeds_out[2] = {OutputBuffer<uint64_t>(buffer_seeds, (uint32_t *)seed_lens.data),
+                                         OutputBuffer<uint64_t>(buffer_seeds_2, (uint32_t *)seed_lens.data + 1)};
+  CudaEventWrapper hashed[2], consumed[2];
+#endif
   auto &stage_filter_seeds = stage_stats.emplace_back("filter_seeds", nullptr, &host_buffer_lens.results_len_filter_seeds, KernelFilterSeeds::threads_per_run, outputs_filter_seeds.max_len);
 
   auto &stage_init_seeds = stage_stats.emplace_back("init_seeds", stage_filter_seeds.outputs_len, stage_filter_seeds.outputs_len, 1, KernelSeed1::threads_per_run);
@@ -2528,7 +2668,12 @@ void GpuThread::run() {
   auto &stage_init_seeds_0b = stage_stats.emplace_back("init_seeds_0b", stage_filter_2_0a.outputs_len, stage_filter_2_0a.outputs_len, 1, outputs_filter_2_0a.max_len);
   auto &stage_filter_gradvecs_2 = stage_stats.emplace_back("filter_gradvecs_2", stage_filter_2_0a.outputs_len, &host_buffer_lens.results_len_filter_gradvecs_2, KernelFilterGradVecs2::threads_per_seed, outputs_filter_gradvecs_2.max_len);
 
-  OutputBuffer<SeedPos> outputs_filter_2_0b(buffer_2, &device_buffer_lens->results_len_filter_2_0b);
+  // filter_2_01b reads the gradvecs_2 outputs from buffer_2, so it must not write there too: warps take their
+  // inputs in grid-stride order, and one that has not yet read an early input can find it overwritten by
+  // another warp's output (that input is lost and the output tested twice). Rare while the kernel has the GPU
+  // to itself, frequent once it shares SMs with another stream (TUNE_OVERLAP). buffer_1 (the filter_2_01a
+  // outputs) is free again once gradvecs_2 has run, and the cascade then alternates starting from buffer_2.
+  OutputBuffer<SeedPos> outputs_filter_2_0b(buffer_1, &device_buffer_lens->results_len_filter_2_0b);
   auto &stage_filter_2_0b = stage_stats.emplace_back("filter_2_01b", stage_filter_gradvecs_2.outputs_len, &host_buffer_lens.results_len_filter_2_0b, 1, outputs_filter_2_0b.max_len);
 
   auto &stage_init_seeds_late_1 = stage_stats.emplace_back("init_seeds_late_1", stage_filter_2_0b.outputs_len, stage_filter_2_0b.outputs_len, 1, outputs_filter_2_0b.max_len);
@@ -2557,7 +2702,7 @@ void GpuThread::run() {
   {
     uint32_t *inputs_len = stage_filter_2_0b.outputs_len;
     for (size_t i = 0; i < sizeof(filter_2_runs) / sizeof(*filter_2_runs); i++) {
-      OutputBuffer<SeedPos> outputs(i % 2 == 0 ? buffer_1 : buffer_2, &device_buffer_lens->results_len_filter_2[i]);
+      OutputBuffer<SeedPos> outputs(i % 2 == 0 ? buffer_2 : buffer_1, &device_buffer_lens->results_len_filter_2[i]);
 
       uint32_t *outputs_len = &host_buffer_lens.results_len_filter_2[i];
       auto &stage = stage_stats.emplace_back(std::string("filter_2") + (char)('a' + i), inputs_len, outputs_len, 1, outputs.max_len);
@@ -2573,15 +2718,41 @@ void GpuThread::run() {
 
   auto start = std::chrono::steady_clock::now();
 
-  for (uint32_t i = 0; !should_stop() && (!benchmark || i < PRINT_INTERVAL); i++) {
-    uint64_t start_seed = input.next(KernelFilterSeeds::threads_per_run);
+  auto chain_start = [&](uint64_t start_seed) {
 #if TUNE_CHAIN_HASH
     // position in the scan -> chain value of the batch's first seed
-    const uint64_t batch_start = (input.origin ^ XrsrRandom::XRSR_SILVER_RATIO)
-                               + (start_seed - input.origin) * XrsrRandom::XRSR_GOLDEN_RATIO;
+    return (input.origin ^ XrsrRandom::XRSR_SILVER_RATIO) + (start_seed - input.origin) * XrsrRandom::XRSR_GOLDEN_RATIO;
 #else
-    const uint64_t batch_start = start_seed;
+    return start_seed;
 #endif
+  };
+#if TUNE_OVERLAP
+  // hash one batch into survivor slot `slot` on the low-priority stream, once batch i-2 is done reading it
+  auto launch_hash = [&](uint32_t slot) {
+    const uint64_t start_seed = input.next(KernelFilterSeeds::threads_per_run);
+    TRY_CUDA(cudaStreamWaitEvent(hstream, consumed[slot].event, 0));
+    TRY_CUDA(cudaMemsetAsync(seeds_out[slot].len, 0, sizeof(uint32_t), hstream));
+    KernelFilterSeeds::run(chain_start(start_seed), seeds_out[slot], hstream);
+    hashed[slot].record(hstream);
+    return start_seed;
+  };
+  uint64_t pending_start = launch_hash(0);
+  bool pending = true;
+  for (uint32_t i = 0; pending; i++) {
+    const uint32_t slot = i & 1u;
+    const uint64_t start_seed = pending_start;
+    pending = !should_stop() && (!benchmark || i + 1 < PRINT_INTERVAL);
+    if (pending) { pending_start = launch_hash(slot ^ 1u); }
+    outputs_filter_seeds = seeds_out[slot];
+
+    TRY_CUDA(cudaStreamWaitEvent(stream, hashed[slot].event, 0));
+    TRY_CUDA(cudaMemsetAsync(device_buffer_lens, 0, sizeof(*device_buffer_lens), stream));
+    event_start.record(stream);
+    stage_filter_seeds.record(stream);
+#else
+  for (uint32_t i = 0; !should_stop() && (!benchmark || i < PRINT_INTERVAL); i++) {
+    uint64_t start_seed = input.next(KernelFilterSeeds::threads_per_run);
+    const uint64_t batch_start = chain_start(start_seed);
 
     TRY_CUDA(cudaMemsetAsync(device_buffer_lens, 0, sizeof(*device_buffer_lens), stream));
 
@@ -2589,6 +2760,7 @@ void GpuThread::run() {
 
     KernelFilterSeeds::run(batch_start, outputs_filter_seeds, stream);
     stage_filter_seeds.record(stream);
+#endif
 
     KernelSeed1::kernel<<<KernelSeed1::threads_per_run / KernelSeed1::threads_per_block, KernelSeed1::threads_per_block, 0, stream>>>(outputs_filter_seeds, results);
     TRY_CUDA(cudaGetLastError());
@@ -2638,6 +2810,10 @@ void GpuThread::run() {
     }
 
     TRY_CUDA(cudaMemcpyAsync(&host_buffer_lens, device_buffer_lens, sizeof(host_buffer_lens), cudaMemcpyDeviceToHost, stream));
+#if TUNE_OVERLAP
+    TRY_CUDA(cudaMemcpyAsync(&host_buffer_lens.results_len_filter_seeds, outputs_filter_seeds.len, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+    consumed[slot].record(stream);   // (the host also waits for this batch before hashing into the slot again)
+#endif
 
     TRY_CUDA(cudaStreamSynchronize(stream));
 
