@@ -1715,7 +1715,11 @@ void GpuThread::run() {
   OutputBuffer<SeedPos> outputs_filter_gradvecs_2(buffer_2, &device_buffer_lens->results_len_filter_gradvecs_2);
   auto &stage_filter_gradvecs_2 = stage_stats.emplace_back("filter_gradvecs_2", stage_filter_2_0a.outputs_len, &host_buffer_lens.results_len_filter_gradvecs_2, KernelFilterGradVecs2::threads_per_seed, outputs_filter_gradvecs_2.max_len);
 
-  OutputBuffer<SeedPos> outputs_filter_2_0b(buffer_2, &device_buffer_lens->results_len_filter_2_0b);
+  // filter_2_01b reads the gradvecs_2 outputs from buffer_2, so it must not write there too: warps take their
+  // inputs in grid-stride order, and one that has not yet read an early input can find it overwritten by
+  // another warp's output (that input is lost and the output tested twice). buffer_1 (the filter_2_01a
+  // outputs) is free again once gradvecs_2 has run, and the cascade then alternates starting from buffer_2.
+  OutputBuffer<SeedPos> outputs_filter_2_0b(buffer_1, &device_buffer_lens->results_len_filter_2_0b);
   auto &stage_filter_2_0b = stage_stats.emplace_back("filter_2_01b", stage_filter_gradvecs_2.outputs_len, &host_buffer_lens.results_len_filter_2_0b, 1, outputs_filter_2_0b.max_len);
 
   auto &stage_init_seeds_late_1 = stage_stats.emplace_back("init_seeds_late_1", stage_filter_2_0b.outputs_len, stage_filter_2_0b.outputs_len, 1, outputs_filter_2_0b.max_len);
@@ -1744,7 +1748,7 @@ void GpuThread::run() {
   {
     uint32_t *inputs_len = stage_filter_2_0b.outputs_len;
     for (size_t i = 0; i < sizeof(filter_2_runs) / sizeof(*filter_2_runs); i++) {
-      OutputBuffer<SeedPos> outputs(i % 2 == 0 ? buffer_1 : buffer_2, &device_buffer_lens->results_len_filter_2[i]);
+      OutputBuffer<SeedPos> outputs(i % 2 == 0 ? buffer_2 : buffer_1, &device_buffer_lens->results_len_filter_2[i]);
 
       uint32_t *outputs_len = &host_buffer_lens.results_len_filter_2[i];
       auto &stage = stage_stats.emplace_back(std::string("filter_2") + (char)('a' + i), inputs_len, outputs_len, 1, outputs.max_len);
