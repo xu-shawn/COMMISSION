@@ -1276,7 +1276,11 @@ __launch_bounds__(block_dim_x) void kernel(
       }
     }
     __syncthreads();
+#if TUNE_GV1_EXP == 11
+    const uint32_t n_cand = 0;   // timing experiment: setup only
+#else
     const uint32_t n_cand = cand_n;
+#endif
 
     // One thread per nx now, rather than per nz: nx fixes the four y=0 and four
     // y=1 lattice offsets for the whole seed, so they are read once into
@@ -1357,6 +1361,9 @@ __launch_bounds__(block_dim_x) void kernel(
 #endif
 
     uint32_t sq_n = 0;   // uniform across the warp
+#if TUNE_GV1_EXP == 12
+    uint32_t exp_sink = 0;
+#endif
     const uint32_t lanemask_lt = (1u << lane) - 1u;
 
     // The gate passes about 166 of a seed's 65536 positions, so 97.7% of these
@@ -1376,6 +1383,9 @@ __launch_bounds__(block_dim_x) void kernel(
         if (a + b >= kGradVecs1GateZ0Threshold) { hitmask |= (1u << j); }
       }
 
+#if TUNE_GV1_EXP == 12
+      exp_sink += __popc(hitmask); hitmask = 0u;   // timing experiment: scan without queue or score
+#endif
       // Drains one hit per lane per pass, so this runs as many times as the
       // busiest lane in the warp has hits -- about three, against n_cand
       // ballots before. Every lane stays in the loop until the ballot is empty,
@@ -1406,10 +1416,217 @@ __launch_bounds__(block_dim_x) void kernel(
       __syncwarp();
       OMISSION_SCORE_DRAIN(sq_n)
     }
+#if TUNE_GV1_EXP == 12
+    if (exp_sink == 0xFFFFFFFFu) atomicAdd(outputs.len, 0);
+#endif
 #undef OMISSION_SCORE_DRAIN
   }
 }
 
+#if TUNE_GV1_V4
+// Same candidates as `kernel`, with the gate evaluated as a join instead of a scan.
+//
+// `kernel` checks every listed row t against all 256 lattice columns nx: about 13,000 checks per seed, each a
+// randomly addressed shared read B[t + d(nx)], for ~650 passes (55% of this stage on Pascal). But the
+// gate A[t] + B[u] >= T can only pass when A[t] >= T - max(B) (the existing list) and B[u] >= T - max(A) (a
+// second list, also ~1/5 of the rows). Joining the two lists checks ~2,600 pairs per seed from consecutive
+// addresses; a passing pair (t, u) belongs to every column whose lag d(nx) = i0[nx+3] - i0[nx+2] equals u - t,
+// found through per-lag linked lists (one column per lag on average). The pass set is the same: a pass of
+// `kernel` has B[u] >= T - a - ulp >= T - max(A) - 1e-3, so u is in the second list. Survivors are scored by the
+// same arithmetic in the same order.
+__global__
+__launch_bounds__(block_dim_x) void kernel_v4(
+    const InputBuffer<uint64_t> seeds,
+    OutputBuffer<SeedPos> outputs,
+    const KernelSeed1::Result* __restrict__ results)
+{
+  __shared__ alignas(16) ImprovedNoise oct_buf[2];
+  __shared__ alignas(16) float shared_kernel_0A[4][6][16][2];   // kernel columns 1..4
+  __shared__ float conv_z0[256][5];
+  __shared__ float conv_z1[256][5];
+  __shared__ alignas(16) uint8_t idx_xy[2][272];
+  __shared__ uint8_t cand_t[256];
+  __shared__ float   cand_a[256];
+  __shared__ uint8_t candb_u[256];
+  __shared__ float   candb_v[256];
+  __shared__ int     lag_head[256];
+  __shared__ int16_t lag_next[256];
+  constexpr uint32_t pair_cap = 512, surv_cap = 1024;
+  __shared__ uint16_t pairs[pair_cap];    // t << 8 | u
+  __shared__ uint16_t surv[surv_cap];     // nx << 8 | t
+  __shared__ uint32_t counters[4];        // cand_n, candb_n, pair_n, surv_n
+  __shared__ float red_max[8], red_max_a[8];
+
+  const uint32_t tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u;
+  const uint32_t lanemask_lt = (1u << lane) - 1u;
+
+  for (uint32_t i = tid; i < 4 * 6 * 16 * 2 / 4; i += block_dim_x) {
+    reinterpret_cast<uint4*>(shared_kernel_0A)[i] = reinterpret_cast<const uint4*>(&device_kernel_0A[1][0][0][0])[i];
+  }
+  const uint32_t seeds_len = *seeds.len;
+  uint32_t buf = 0u;
+  if (blockIdx.x < seeds_len && tid < 17) {
+    reinterpret_cast<uint4*>(&oct_buf[0])[tid] = reinterpret_cast<const uint4*>(&results[blockIdx.x].continentalness_0A)[tid];
+  }
+
+  for (uint32_t seed_index = blockIdx.x; seed_index < seeds_len; seed_index += gridDim.x) {
+    __syncthreads();
+    const uint32_t next_seed = seed_index + gridDim.x;
+    if (next_seed < seeds_len && tid < 17) {
+      reinterpret_cast<uint4*>(&oct_buf[buf ^ 1u])[tid] = reinterpret_cast<const uint4*>(&results[next_seed].continentalness_0A)[tid];
+    }
+    const ImprovedNoise &oct_0A = oct_buf[buf];
+    buf ^= 1u;
+
+    {
+      const uint32_t nz = tid;
+      uint32_t p_z[6];
+#pragma unroll
+      for (int32_t dnz = 0; dnz < 6; ++dnz) p_z[dnz] = oct_0A.p[(nz + dnz) & 0xFF] & 0xF;
+#pragma unroll
+      for (int32_t x = 0; x < 4; ++x) {
+        float conv0 = 0.0f, conv1 = 0.0f;
+#pragma unroll
+        for (int32_t dnz = 0; dnz < 6; ++dnz) {
+          conv0 += shared_kernel_0A[x][dnz][p_z[dnz]][0];
+          conv1 += shared_kernel_0A[x][dnz][p_z[dnz]][1];
+        }
+        conv_z0[nz][x] = conv0;
+        conv_z1[nz][x] = conv1;
+      }
+    }
+    const int32_t cell_size = 512 * large_biomes_pos_mul;
+    const int32_t x_center = (2.5f - oct_0A.xo) * cell_size;
+    const int32_t ny = oct_0A.yo;
+    const int32_t z_center = (2.5f - oct_0A.zo) * cell_size;
+    {
+      const uint8_t idx_x = oct_0A.p[tid];
+      const uint8_t v0 = oct_0A.p[(idx_x + ny) & 0xFF];
+      const uint8_t v1 = oct_0A.p[(idx_x + ny + 1) & 0xFF];
+      idx_xy[0][tid] = v0;
+      idx_xy[1][tid] = v1;
+      if (tid < 6) { idx_xy[0][256 + tid] = v0; idx_xy[1][256 + tid] = v1; }
+    }
+    if (tid < 4) counters[tid] = 0;
+    lag_head[tid] = -1;
+    __syncthreads();
+
+    {
+      float mb = conv_z0[tid][2], ma = conv_z0[tid][1];
+#pragma unroll
+      for (int off = 16; off; off >>= 1) {
+        mb = fmaxf(mb, __shfl_down_sync(0xFFFFFFFFu, mb, off));
+        ma = fmaxf(ma, __shfl_down_sync(0xFFFFFFFFu, ma, off));
+      }
+      if (lane == 0) { red_max[warp] = mb; red_max_a[warp] = ma; }
+      const uint32_t dl = (uint32_t)(idx_xy[0][tid + 3] - idx_xy[0][tid + 2]) & 0xFFu;
+      lag_next[tid] = (int16_t)atomicExch(&lag_head[dl], (int)tid);
+    }
+    __syncthreads();
+    float max_b = red_max[0], max_a = red_max_a[0];
+#pragma unroll
+    for (int k = 1; k < 8; ++k) { max_b = fmaxf(max_b, red_max[k]); max_a = fmaxf(max_a, red_max_a[k]); }
+    {
+      const float a = conv_z0[tid][1];
+      const bool keep = (a >= kGradVecs1GateZ0Threshold - max_b - 1.0e-3f);    // as in `kernel`
+      const uint32_t m = __ballot_sync(0xFFFFFFFFu, keep);
+      uint32_t base = 0;
+      if (lane == 0 && m) base = atomicAdd(&counters[0], __popc(m));
+      base = __shfl_sync(0xFFFFFFFFu, base, 0);
+      if (keep) { const uint32_t sl = base + __popc(m & lanemask_lt); cand_t[sl] = (uint8_t)tid; cand_a[sl] = a; }
+      const float b = conv_z0[tid][2];
+      const bool keepb = (b >= kGradVecs1GateZ0Threshold - max_a - 1.0e-3f);
+      const uint32_t mbb = __ballot_sync(0xFFFFFFFFu, keepb);
+      uint32_t baseb = 0;
+      if (lane == 0 && mbb) baseb = atomicAdd(&counters[1], __popc(mbb));
+      baseb = __shfl_sync(0xFFFFFFFFu, baseb, 0);
+      if (keepb) { const uint32_t sl = baseb + __popc(mbb & lanemask_lt); candb_u[sl] = (uint8_t)tid; candb_v[sl] = b; }
+    }
+    __syncthreads();
+    const uint32_t n_cand = counters[0], n_candb = counters[1];
+
+    auto score_one = [&](uint32_t nxv, uint32_t t_) {
+      const uint32_t r1 = idx_xy[0][nxv + 1], r2 = idx_xy[0][nxv + 2];
+      const uint32_t r3 = idx_xy[0][nxv + 3], r4 = idx_xy[0][nxv + 4];
+      const uint32_t s1 = idx_xy[1][nxv + 1], s2 = idx_xy[1][nxv + 2];
+      const uint32_t s3 = idx_xy[1][nxv + 3], s4 = idx_xy[1][nxv + 4];
+      const uint32_t nzv = (t_ - r2) & 0xFF;
+      const float sc = (conv_z0[(r2 + nzv) & 0xFF][1]
+                      + conv_z0[(r3 + nzv) & 0xFF][2])
+                     + conv_z0[(r1 + nzv) & 0xFF][0]
+                     + conv_z0[(r4 + nzv) & 0xFF][3]
+                     + conv_z1[(s1 + nzv) & 0xFF][0]
+                     + conv_z1[(s2 + nzv) & 0xFF][1]
+                     + conv_z1[(s3 + nzv) & 0xFF][2]
+                     + conv_z1[(s4 + nzv) & 0xFF][3];
+      if (sc > kGradVecs1FinalThreshold) {
+        uint32_t ri_ = atomicAdd(outputs.len, 1);
+        if (ri_ < outputs.max_len) {
+          outputs.data[ri_] = {seed_index, x_center + (int32_t)nxv * cell_size, z_center + (int32_t)nzv * cell_size};
+        }
+      }
+    };
+    // every column with lag u - t, scored in place (overflow paths only)
+    auto expand_score = [&](uint32_t t_, uint32_t u_) {
+      for (int k = lag_head[(u_ - t_) & 0xFFu]; k >= 0; k = lag_next[k]) score_one((uint32_t)k, t_);
+    };
+
+    // 1. join: a warp per A row, lanes over the B rows
+    for (uint32_t c = warp; c < n_cand; c += block_dim_x / 32) {
+      const uint32_t t = cand_t[c];
+      const float a = cand_a[c];
+      for (uint32_t j0 = 0; j0 < n_candb; j0 += 32u) {
+        const uint32_t j = j0 + lane;
+        bool pass = false; uint32_t u = 0;
+        if (j < n_candb) { u = candb_u[j]; pass = (a + candb_v[j] >= kGradVecs1GateZ0Threshold); }
+        const uint32_t m = __ballot_sync(0xFFFFFFFFu, pass);
+        if (m == 0u) continue;
+        uint32_t base = 0;
+        if (lane == 0) base = atomicAdd(&counters[2], __popc(m));
+        base = __shfl_sync(0xFFFFFFFFu, base, 0);
+        if (pass) {
+          const uint32_t sl = base + __popc(m & lanemask_lt);
+          if (sl < pair_cap) pairs[sl] = (uint16_t)((t << 8) | u);
+          else expand_score(t, u);
+        }
+      }
+    }
+    __syncthreads();
+    // 2. expand pairs to (column, row) survivors
+    {
+      const uint32_t n_pairs = counters[2] < pair_cap ? counters[2] : pair_cap;
+      for (uint32_t p0 = 0; p0 < n_pairs; p0 += block_dim_x) {
+        const uint32_t pi = p0 + tid;
+        uint32_t t = 0; int k = -1;
+        if (pi < n_pairs) { const uint32_t e = pairs[pi]; t = e >> 8; k = lag_head[((e & 0xFFu) - t) & 0xFFu]; }
+        for (;;) {
+          const bool have = (k >= 0);
+          const uint32_t m = __ballot_sync(0xFFFFFFFFu, have);
+          if (m == 0u) break;
+          uint32_t base = 0;
+          if (lane == 0) base = atomicAdd(&counters[3], __popc(m));
+          base = __shfl_sync(0xFFFFFFFFu, base, 0);
+          if (have) {
+            const uint32_t sl = base + __popc(m & lanemask_lt);
+            if (sl < surv_cap) surv[sl] = (uint16_t)(((uint32_t)k << 8) | t);
+            else score_one((uint32_t)k, t);
+            k = lag_next[k];
+          }
+        }
+      }
+    }
+    __syncthreads();
+    // 3. score the survivors
+    {
+      const uint32_t n_surv = counters[3] < surv_cap ? counters[3] : surv_cap;
+      for (uint32_t i = tid; i < n_surv; i += block_dim_x) {
+        const uint32_t e = surv[i];
+        score_one(e >> 8, e & 0xFFu);
+      }
+    }
+  }
+}
+#endif
 #if TUNE_GV1_V3
 __global__
 __launch_bounds__(block_dim_x) void kernel_v3(
@@ -1907,7 +2124,9 @@ void run(
   // TUNE_GV1_BPS > 0 caps the grid at that many blocks per SM, which leaves room on every SM for blocks of the
   // seed hashing running beside it (TUNE_OVERLAP)
   static const int blocks = TUNE_GV1_BPS > 0 ? device_sms() * TUNE_GV1_BPS : 4096;
-#if TUNE_GV1_V3
+#if TUNE_GV1_V4
+  kernel_v4<<<blocks, block_dim_x, 0, stream>>>(seeds, outputs, results);
+#elif TUNE_GV1_V3
   kernel_v3<<<blocks, block_dim_x, 0, stream>>>(seeds, outputs, results);
 #elif TUNE_GV1_V2
   kernel_v2<<<blocks, block_dim_x, 0, stream>>>(seeds, outputs, results);
@@ -3398,6 +3617,9 @@ void GpuThread::run() {
 #endif
 #if TUNE_GV1_V3
   TRY_CUDA(cudaFuncSetAttribute(KernelFilterGradVecs1::kernel_v3, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+#endif
+#if TUNE_GV1_V4
+  TRY_CUDA(cudaFuncSetAttribute(KernelFilterGradVecs1::kernel_v4, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
 #endif
   init_grad_dot_table();
   init_conv_kernels();

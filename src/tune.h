@@ -209,7 +209,7 @@
 #define TUNE_GV1_V2 0
 #endif
 
-// timing experiments on kernel_v2 only (wrong results): 1 = setup without scan, 2 = scan without queue/score
+// timing experiments (wrong results): kernel_v2: 1 = setup only, 2 = scan without queue/score; kernel: 11, 12 the same
 #ifndef TUNE_GV1_EXP
 #define TUNE_GV1_EXP 0
 #endif
@@ -245,4 +245,9 @@
 // candidates as `kernel`.
 #ifndef TUNE_GV1_V3
 #define TUNE_GV1_V3 0
+#endif
+
+// gradvecs_1 gate as a join of the A-row and B-row lists with per-lag column lists (kernel_v4). Same candidates.
+#ifndef TUNE_GV1_V4
+#define TUNE_GV1_V4 0
 #endif
