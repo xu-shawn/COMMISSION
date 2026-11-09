@@ -31,6 +31,9 @@ static void gv1_ctx(Seed &s, GV1Ctx &c) {
     int ny = int(o.yo);
     for (int n = 0; n < 262; n++) for (int y = 0; y < 2; y++) c.idx[y][n] = o.p[(o.p[n & 255] + ny + y) & 255];
 }
+static void gv1_terms(const GV1Ctx &c, int nx, int nz, float tm[8]) {   // layer 0 x=1..4, layer 1 x=1..4
+    for (int y = 0; y < 2; y++) for (int i = 1; i <= 4; i++) tm[y * 4 + i - 1] = c.conv[y][(c.idx[y][nx + i] + nz) & 255][i - 1];
+}
 static void gv1_score(const GV1Ctx &c, int nx, int nz, float &gate, float &fin, float g[4]) {
     auto C = [&](int y, int i, int col) { return c.conv[y][(c.idx[y][nx + i] + nz) & 255][col]; };
     gate = C(0, 2, 1) + C(0, 3, 2);
@@ -103,6 +106,7 @@ static std::string process(const std::string &line) {
         for (int dz = -2; dz <= 2; dz++) {
             int nx = (cnx + dx) & 255, nz = (cnz + dz) & 255;
             float gate, fin, gg[4]; gv1_score(g1, nx, nz, gate, fin, gg);
+            float tm[8]; gv1_terms(g1, nx, nz, tm);
             long ax = g1.xc + long(nx) * 512, az = g1.zc + long(nz) * 512;   // A candidate, biome units
             int amin = two_octave_count(s, 0, int(ax), int(az));
             int af[12] = {0}; float am = 0;
@@ -121,8 +125,8 @@ static std::string process(const std::string &line) {
                     c2d = c2c ? casc(s, 18, 10240, 16384, false, r) : 0;
                 }
             }
-            snprintf(buf, sizeof buf, "%lld %.0f %.4f %d %d %.4f %.4f %d %.4f %.4f %d %d %d %d %d %d %d %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f  %.4f %d %d %d %d %d %d %d %d %d %d %d %d\n",
-                     sd, area, ph, nx, nz, gate, fin, amin, g2g, g2f, j, c2a, c2b, c2c, c2d, j64, j16, dd[0], dd[1], dd[2], dd[3], dd[4], dd[5], gg[0], gg[1], gg[2], gg[3], am, af[0], af[1], af[2], af[3], af[4], af[5], af[6], af[7], af[8], af[9], af[10], af[11]);
+            snprintf(buf, sizeof buf, "%lld %.0f %.4f %d %d %.4f %.4f %d %.4f %.4f %d %d %d %d %d %d %d %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f  %.4f %d %d %d %d %d %d %d %d %d %d %d %d  %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
+                     sd, area, ph, nx, nz, gate, fin, amin, g2g, g2f, j, c2a, c2b, c2c, c2d, j64, j16, dd[0], dd[1], dd[2], dd[3], dd[4], dd[5], gg[0], gg[1], gg[2], gg[3], am, af[0], af[1], af[2], af[3], af[4], af[5], af[6], af[7], af[8], af[9], af[10], af[11], tm[0], tm[1], tm[2], tm[3], tm[4], tm[5], tm[6], tm[7]);
             out += buf;
         }
     return out;

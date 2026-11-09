@@ -251,3 +251,29 @@
 #ifndef TUNE_GV1_V4
 #define TUNE_GV1_V4 0
 #endif
+
+// seed hashing: seeds per thread and unroll of the per-seed loop
+#ifndef TUNE_SEEDS_PER_THREAD
+#define TUNE_SEEDS_PER_THREAD 32
+#endif
+#ifndef TUNE_HASH_UNROLL
+#define TUNE_HASH_UNROLL 2
+#endif
+
+// gradvecs_1 gate on the bottom (0) or top (1) layer's central pair (kernel only)
+#ifndef TUNE_GV1_GATE_LAYER
+#define TUNE_GV1_GATE_LAYER 0
+#endif
+
+// Phase-adaptive gradvecs_1 final cut (kernel only): cut + slope * (phase score - centre). At equal output the
+// fitted models give about +0.7% islands (slope 0.75, centre 1.137 for the refitted gate), but storing the phase
+// scores behind the survivors made the run about 2.7% slower on Pascal. TUNE_GV1_PHASE_ADAPT 1 = on.
+#ifndef TUNE_GV1_PHASE_ADAPT
+#define TUNE_GV1_PHASE_ADAPT 0
+#endif
+#ifndef TUNE_GV1_PHASE_SLOPE
+#define TUNE_GV1_PHASE_SLOPE 0.75f
+#endif
+#ifndef TUNE_GV1_PHASE_CENTRE
+#define TUNE_GV1_PHASE_CENTRE 1.137f
+#endif

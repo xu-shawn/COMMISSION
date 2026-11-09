@@ -385,7 +385,8 @@ __device__ inline void XrsrRandom_double_fork(XrsrRandom &rng, XrsrRandomFork &f
 namespace KernelFilterSeeds {
 constexpr uint32_t threads_per_block = 256;
 constexpr uint32_t threads_per_run = UINT64_C(1) << TUNE_LOG2_BATCH;
-constexpr uint32_t seeds_per_thread = 32;
+constexpr uint32_t seeds_per_thread = TUNE_SEEDS_PER_THREAD;
+constexpr int kHashUnroll = TUNE_HASH_UNROLL;
 
 __device__ XrsrRandomFork noise_yo_fork(XrsrRandomFork noise_fork) {
   uint64_t l = noise_fork.lo;
@@ -433,6 +434,30 @@ __device__ float octave_yo_mod1(const XrsrRandomFork &noise_yo_fork) {
   return (uint32_t)((r >> 32) & 0xFFFFFF) * 5.9604645E-8f;
 }
 
+// The phase score filter_seeds gives a seed (same terms; used by gradvecs_1's phase-adaptive final cut).
+__device__ float phase_score_of(uint64_t seed) {
+  const XrsrRandomFork seed_fork = XrsrRandom_seed_fork(seed);
+  XrsrRandom nr;
+  nr.lo = seed_fork.lo ^ device_chosen_continentalness_config.fork_hash.lo;
+  nr.hi = seed_fork.hi ^ device_chosen_continentalness_config.fork_hash.hi;
+  const auto a_yo = noise_yo_fork(fork_short(nr));
+  advance_one(nr);
+  const auto b_yo = noise_yo_fork(nr.fork());
+  float sc = TUNE_W0 * yo_penalty(octave_yo_mod1<chosen_continentalness_config.octaves_a[0]>(a_yo));
+  sc = SCORE_COMBINE(sc, TUNE_W0 * yo_penalty(octave_yo_mod1<chosen_continentalness_config.octaves_b[0]>(b_yo)));
+  sc = SCORE_COMBINE(sc, TUNE_W1 * yo_penalty(octave_yo_mod1<chosen_continentalness_config.octaves_a[1]>(a_yo)));
+  sc = SCORE_COMBINE(sc, TUNE_W1 * yo_penalty(octave_yo_mod1<chosen_continentalness_config.octaves_b[1]>(b_yo)));
+  sc = SCORE_COMBINE(sc, TUNE_W2 * yo_penalty(octave_yo_mod1<chosen_continentalness_config.octaves_a[2]>(a_yo)));
+  sc = SCORE_COMBINE(sc, TUNE_W2 * yo_penalty(octave_yo_mod1<chosen_continentalness_config.octaves_b[2]>(b_yo)));
+  return sc;
+}
+
+#if TUNE_GV1_PHASE_ADAPT
+// the survivor buffer holds the phase scores behind the seeds (gradvecs_1's phase-adaptive cut reads them)
+#define PHASE_STORE(I, SC) (reinterpret_cast<float *>(outputs.data + (UINT32_C(1) << TUNE_LOG2_SURVIVORS))[(I)] = (SC))
+#else
+#define PHASE_STORE(I, SC) ((void)0)
+#endif
 __global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed, OutputBuffer<uint64_t> outputs, uint64_t mix1, uint64_t mix2) {
   // 0.045f, 0.035f, 0.03f, 0.025f  ==  1 in 2700, 9400, 26000, 54000
   //
@@ -558,7 +583,7 @@ __global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed,
                   octave_yo_mod1<chosen_continentalness_config.octaves_b[2]>(b_yo)));    \
               if (sc < maxScore) {                                                      \
                 uint32_t ri = atomicAdd(outputs.len, 1);                                \
-                if (ri < outputs.max_len) { outputs.data[ri] = seed_; }                 \
+                if (ri < outputs.max_len) { outputs.data[ri] = seed_; PHASE_STORE(ri, sc); } \
               }                                                                         \
             }                                                                           \
           }                                                                             \
@@ -568,7 +593,7 @@ __global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed,
   }
 
 #if TUNE_CHAIN_HASH
-#pragma unroll 2
+#pragma unroll kHashUnroll
   for (uint32_t r = 0; r < N; ++r) {
     const uint64_t s = chain_t;                                   // s ^ SILVER is the seed
     chain_t += XrsrRandom::XRSR_GOLDEN_RATIO;
@@ -1160,6 +1185,7 @@ __launch_bounds__(block_dim_x) void kernel(
   // that work at full width instead. Depth 64: a drain leaves at most 31 behind
   // and the next round can add 32.
   __shared__ uint32_t score_q[block_dim_x / 32][64];
+  __shared__ float fin_thr_s;   // this seed's final cut (phase-adaptive with TUNE_GV1_PHASE_SLOPE)
   __shared__ float   red_max[8];
 #if TUNE_GV1_DRAIN2
   // the four lattice bytes a score reads per layer (offsets nx+1 .. nx+4), packed into one word
@@ -1211,8 +1237,10 @@ __launch_bounds__(block_dim_x) void kernel(
 #pragma unroll
         for (int32_t dnz = 0; dnz < 6; ++dnz) {
           const uint32_t p = p_z[dnz];
-          conv0 += shared_kernel_0A[dnx][dnz][p][0];
-          conv1 += shared_kernel_0A[dnx][dnz][p][1];
+          // TUNE_GV1_GATE_LAYER 1: the tables called layer 0 here hold the top layer, so the gate (on "layer 0")
+          // scores the top layer's central pair; the final score is the same eight terms in another order
+          conv0 += shared_kernel_0A[dnx][dnz][p][TUNE_GV1_GATE_LAYER];
+          conv1 += shared_kernel_0A[dnx][dnz][p][1 - TUNE_GV1_GATE_LAYER];
         }
 
         conv_z0[nz][dnx - 1] = conv0;
@@ -1226,8 +1254,8 @@ __launch_bounds__(block_dim_x) void kernel(
     const int32_t z_center = (2.5f - oct_0A.zo) * cell_size;
 
     const uint8_t idx_x = oct_0A.p[nz];
-    const uint8_t v0 = oct_0A.p[(idx_x + ny) & 0xFF];
-    const uint8_t v1 = oct_0A.p[(idx_x + ny + 1) & 0xFF];
+    const uint8_t v0 = oct_0A.p[(idx_x + ny + TUNE_GV1_GATE_LAYER) & 0xFF];
+    const uint8_t v1 = oct_0A.p[(idx_x + ny + 1 - TUNE_GV1_GATE_LAYER) & 0xFF];
     idx_xy[0][nz] = v0;
     idx_xy[1][nz] = v1;
 
@@ -1236,7 +1264,17 @@ __launch_bounds__(block_dim_x) void kernel(
       idx_xy[1][256 + nz] = v1;
     }
 
-    if (nz == 0) { cand_n = 0; }
+    if (nz == 0) {
+      cand_n = 0;
+#if TUNE_GV1_PHASE_ADAPT
+      // Island probability falls as exp(-phase score) and as exp(1.33 x final score), so at equal output a seed
+      // with better phases deserves a lower final cut: shift it by slope * (score - centre).
+      fin_thr_s = kGradVecs1FinalThreshold + TUNE_GV1_PHASE_SLOPE
+                * (reinterpret_cast<const float *>(seeds.data + (UINT32_C(1) << TUNE_LOG2_SURVIVORS))[seed_index] - TUNE_GV1_PHASE_CENTRE);
+#else
+      fin_thr_s = kGradVecs1FinalThreshold;
+#endif
+    }
     __syncthreads();
 
 #if TUNE_GV1_DRAIN2
@@ -1279,6 +1317,7 @@ __launch_bounds__(block_dim_x) void kernel(
 #if TUNE_GV1_EXP == 11
     const uint32_t n_cand = 0;   // timing experiment: setup only
 #else
+    const float fin_thr = fin_thr_s;
     const uint32_t n_cand = cand_n;
 #endif
 
@@ -1348,7 +1387,7 @@ __launch_bounds__(block_dim_x) void kernel(
                        + conv_z1[(s2 + nzv) & 0xFF][1]                          \
                        + conv_z1[(s3 + nzv) & 0xFF][2]                          \
                        + conv_z1[(s4 + nzv) & 0xFF][3];                          \
-        if (sc > kGradVecs1FinalThreshold) {                                     \
+        if (sc > fin_thr) {                                     \
           uint32_t ri_ = atomicAdd(outputs.len, 1);                              \
           if (ri_ < outputs.max_len) {                                           \
             outputs.data[ri_] = {seed_index,                                     \
@@ -3672,7 +3711,8 @@ void GpuThread::run() {
   std::FILE *cand_file = nullptr;
 #endif
 
-  DeviceBuffer buffer_seeds(sizeof(uint64_t) * KernelSeed1::threads_per_run);
+  constexpr size_t seed_buffer_factor = TUNE_GV1_PHASE_ADAPT ? 2 : 1;   // phase scores behind the seeds
+  DeviceBuffer buffer_seeds(seed_buffer_factor * sizeof(uint64_t) * KernelSeed1::threads_per_run);
   DeviceBuffer buffer_results(sizeof(KernelSeed1::Result) * KernelSeed1::threads_per_run);
   DeviceBuffer buffer_late_init_flags(sizeof(uint32_t) * KernelSeed1::threads_per_run);
   DeviceBuffer buffer_1(UINT32_C(1) << 31);
@@ -3685,12 +3725,12 @@ void GpuThread::run() {
 
   CudaEventWrapper event_start;
 
-  OutputBuffer<uint64_t> outputs_filter_seeds(buffer_seeds, &device_buffer_lens->results_len_filter_seeds);
+  OutputBuffer<uint64_t> outputs_filter_seeds((uint64_t *)buffer_seeds.data, &device_buffer_lens->results_len_filter_seeds, KernelSeed1::threads_per_run);
 #if TUNE_OVERLAP
-  DeviceBuffer buffer_seeds_2(sizeof(uint64_t) * KernelSeed1::threads_per_run);
+  DeviceBuffer buffer_seeds_2(seed_buffer_factor * sizeof(uint64_t) * KernelSeed1::threads_per_run);
   DeviceBuffer seed_lens(2 * sizeof(uint32_t));
-  OutputBuffer<uint64_t> seeds_out[2] = {OutputBuffer<uint64_t>(buffer_seeds, (uint32_t *)seed_lens.data),
-                                         OutputBuffer<uint64_t>(buffer_seeds_2, (uint32_t *)seed_lens.data + 1)};
+  OutputBuffer<uint64_t> seeds_out[2] = {OutputBuffer<uint64_t>((uint64_t *)buffer_seeds.data, (uint32_t *)seed_lens.data, KernelSeed1::threads_per_run),
+                                         OutputBuffer<uint64_t>((uint64_t *)buffer_seeds_2.data, (uint32_t *)seed_lens.data + 1, KernelSeed1::threads_per_run)};
   CudaEventWrapper hashed[2], consumed[2];
 #endif
   auto &stage_filter_seeds = stage_stats.emplace_back("filter_seeds", nullptr, &host_buffer_lens.results_len_filter_seeds, KernelFilterSeeds::threads_per_run, outputs_filter_seeds.max_len);
