@@ -378,7 +378,12 @@ __device__ float octave_yo_mod1(const XrsrRandomFork &noise_yo_fork) {
 }
 
 __global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed, OutputBuffer<uint64_t> outputs) {
-  constexpr float maxScore = 0.038f; // 0.045f, 0.035f, 0.03f, 0.025f  ==  1 in 2700, 9400, 26000, 54000
+  // Keeps seeds whose octave 0-2 vertical offsets sit near the middle of a lattice layer. The penalty is
+  // quadratic, with weights fitted to how island probability falls with each offset: across thousands of
+  // large islands it goes as exp(-257 d0^2 - 47 d1^2 - 7.5 d2^2), d = |offset - 0.5| per octave and stack.
+  // 1.271 passes the same share of seeds as the former linear score (0.35, 0.11, 0.04 < 0.038, 1 in about
+  // 6,300), so the run is as fast, and the fitted model keeps 8.5% more islands at that rate.
+  constexpr float maxScore = 1.271f;
 
   uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
   uint64_t seed = start_seed + index;
@@ -389,38 +394,38 @@ __global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed,
   const auto noise_a_yo_fork = noise_yo_fork(noise_random.fork());
   
   float c_0A_yo = octave_yo_mod1<chosen_continentalness_config.octaves_a[0]>(noise_a_yo_fork);
-  float score = 0.35f * fabsf(c_0A_yo - 0.5f);
+  float score = 257.3f * (c_0A_yo - 0.5f) * (c_0A_yo - 0.5f);
   if (score >= maxScore) {
     return;
   }
 
   const auto noise_b_yo_fork = noise_yo_fork(noise_random.fork());
   float c_0B_yo = octave_yo_mod1<chosen_continentalness_config.octaves_b[0]>(noise_b_yo_fork);
-  score += 0.35f * fabsf(c_0B_yo - 0.5f);
+  score += 257.3f * (c_0B_yo - 0.5f) * (c_0B_yo - 0.5f);
   if (score >= maxScore) {
     return;
   }
 
   float c_1A_yo = octave_yo_mod1<chosen_continentalness_config.octaves_a[1]>(noise_a_yo_fork);
-  score += 0.11f * fabsf(c_1A_yo - 0.5f);
+  score += 47.4f * (c_1A_yo - 0.5f) * (c_1A_yo - 0.5f);
   if (score >= maxScore) {
     return;
   }
 
   float c_1B_yo = octave_yo_mod1<chosen_continentalness_config.octaves_b[1]>(noise_b_yo_fork);
-  score += 0.11f * fabsf(c_1B_yo - 0.5f);
+  score += 47.4f * (c_1B_yo - 0.5f) * (c_1B_yo - 0.5f);
   if (score >= maxScore) {
     return;
   }
 
   float c_2A_yo = octave_yo_mod1<chosen_continentalness_config.octaves_a[2]>(noise_a_yo_fork);
-  score += 0.04f * fabsf(c_2A_yo - 0.5f);
+  score += 7.5f * (c_2A_yo - 0.5f) * (c_2A_yo - 0.5f);
   if (score >= maxScore) {
     return;
   }
 
   float c_2B_yo = octave_yo_mod1<chosen_continentalness_config.octaves_b[2]>(noise_b_yo_fork);
-  score += 0.04f * fabsf(c_2B_yo - 0.5f);
+  score += 7.5f * (c_2B_yo - 0.5f) * (c_2B_yo - 0.5f);
   if (score >= maxScore) {
     return;
   }
