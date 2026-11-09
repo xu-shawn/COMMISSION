@@ -1156,6 +1156,10 @@ __launch_bounds__(block_dim_x) void kernel(
   // and the next round can add 32.
   __shared__ uint32_t score_q[block_dim_x / 32][64];
   __shared__ float   red_max[8];
+#if TUNE_GV1_DRAIN2
+  // the four lattice bytes a score reads per layer (offsets nx+1 .. nx+4), packed into one word
+  __shared__ uint32_t pk_idx[2][256];
+#endif
 
   const int32_t nz = threadIdx.x;
 
@@ -1230,6 +1234,10 @@ __launch_bounds__(block_dim_x) void kernel(
     if (nz == 0) { cand_n = 0; }
     __syncthreads();
 
+#if TUNE_GV1_DRAIN2
+    pk_idx[0][nz] = (uint32_t)idx_xy[0][nz + 1] | ((uint32_t)idx_xy[0][nz + 2] << 8) | ((uint32_t)idx_xy[0][nz + 3] << 16) | ((uint32_t)idx_xy[0][nz + 4] << 24);
+    pk_idx[1][nz] = (uint32_t)idx_xy[1][nz + 1] | ((uint32_t)idx_xy[1][nz + 2] << 8) | ((uint32_t)idx_xy[1][nz + 3] << 16) | ((uint32_t)idx_xy[1][nz + 4] << 24);
+#endif
     // max over B = conv_z0[.][3], reduced across the block
     {
       float m = conv_z0[nz][2];
@@ -1277,6 +1285,41 @@ __launch_bounds__(block_dim_x) void kernel(
     const uint32_t d = (p3 - p2) & 0xFF;
     const int32_t x = x_center + (int32_t)nx * cell_size;
 
+#if TUNE_GV1_DRAIN2
+    // Same score, same summation order. The bottom-layer terms come first; every term is <= 0, so once the
+    // partial sum is at or below the threshold the full score cannot pass (rounding x + y with y <= 0 never
+    // exceeds x) and the top-layer reads are skipped.
+#define OMISSION_SCORE_DRAIN(ACTIVE)                                             \
+    {                                                                            \
+      const uint32_t act_ = (ACTIVE);                                            \
+      if (lane < act_) {                                                         \
+        const uint32_t e_ = score_q[warp][lane];                                 \
+        const uint32_t nxv = e_ >> 8, t_ = e_ & 0xFFu;                           \
+        const uint32_t w0 = pk_idx[0][nxv];                                      \
+        const uint32_t r2 = (w0 >> 8) & 0xFF;                                    \
+        const uint32_t nzv = (t_ - r2) & 0xFF;                                   \
+        float sc = (conv_z0[t_][1]                                               \
+                  + conv_z0[((w0 >> 16) + nzv) & 0xFF][2])                       \
+                 + conv_z0[(w0 + nzv) & 0xFF][0]                                 \
+                 + conv_z0[((w0 >> 24) + nzv) & 0xFF][3];                        \
+        if (sc > kGradVecs1FinalThreshold) {                                     \
+          const uint32_t w1 = pk_idx[1][nxv];                                    \
+          sc = sc + conv_z1[(w1 + nzv) & 0xFF][0]                                \
+                  + conv_z1[((w1 >> 8) + nzv) & 0xFF][1]                         \
+                  + conv_z1[((w1 >> 16) + nzv) & 0xFF][2]                        \
+                  + conv_z1[((w1 >> 24) + nzv) & 0xFF][3];                       \
+          if (sc > kGradVecs1FinalThreshold) {                                   \
+            uint32_t ri_ = atomicAdd(outputs.len, 1);                            \
+            if (ri_ < outputs.max_len) {                                         \
+              outputs.data[ri_] = {seed_index,                                   \
+                                   x_center + (int32_t)nxv * cell_size,          \
+                                   z_center + (int32_t)nzv * cell_size};         \
+            }                                                                    \
+          }                                                                      \
+        }                                                                        \
+      }                                                                          \
+    }
+#else
 #define OMISSION_SCORE_DRAIN(ACTIVE)                                             \
     {                                                                            \
       const uint32_t act_ = (ACTIVE);                                            \
@@ -1306,6 +1349,7 @@ __launch_bounds__(block_dim_x) void kernel(
         }                                                                        \
       }                                                                          \
     }
+#endif
 
     uint32_t sq_n = 0;   // uniform across the warp
     const uint32_t lanemask_lt = (1u << lane) - 1u;
@@ -2650,8 +2694,8 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos>
 // Measured against 61 islands of 11M and more, 700 of 8-10.5M and 25,000 gradvecs_2 outputs: at -1.05 and a
 // count of 28, it keeps nearly every large island, three fifths of the 8-10.5M ones, and none of the 25,000.
 // one octave's contribution at 8 consecutive x samples (pos_step apart) of one z row, added to vals
-template <OctaveConfig cfg>
-__device__ __forceinline__ void joint_octave(const GradDotTable &table, const ImprovedNoise &oct, int32_t x_base, int32_t z, float (&vals)[8]) {
+template <OctaveConfig cfg, uint32_t N = 8>
+__device__ __forceinline__ void joint_octave(const GradDotTable &table, const ImprovedNoise &oct, int32_t x_base, int32_t z, float (&vals)[N]) {
   constexpr float inf = (float)cfg.input_factor, vf = (float)cfg.value_factor;
   const float y = oct.yo;
   const int32_t int_y = __float2int_rd(y);
@@ -2662,7 +2706,7 @@ __device__ __forceinline__ void joint_octave(const GradDotTable &table, const Im
   int32_t cur = 0; bool have = false;
   float ga, ba, gb, bb;
 #pragma unroll
-  for (uint32_t k = 0; k < 8; k++) {
+  for (uint32_t k = 0; k < N; k++) {
     const float xc = (x_base + (int32_t)(k * T::pos_step)) * inf + oct.xo;
     const int32_t ix = __float2int_rd(xc);
     const float fx = xc - (float)ix;
@@ -2748,8 +2792,126 @@ __global__ __launch_bounds__(threads_per_block) void joint_kernel(InputBuffer<Se
 }
 #endif
 
+
+#if TUNE_JOINT_PRE && TUNE_JOINT_REUSE_A
+// Pre-test for the joint test. Each half-warp takes one input and counts, on 4 whole rows of the 16x16 grid
+// (rows 1, 5, 9, 13; each lane 4 consecutive samples, so lattice cells are reused along x), the samples where
+// the stored octave 0A + 1A sum plus octaves 0B + 1B is below the level. Inputs with at least TUNE_JOINT_PRE
+// of these 64 go on to the full 256-sample test, run by the whole warp. On islands from long runs a pre-test count
+// of 3 keeps 99-100% of those above 10.5M; it passes a small fraction of gradvecs_2's outputs.
+__device__ __forceinline__ void joint_full(const GradDotTable &table, const SeedPos &input, const ImprovedNoise &o0b, const ImprovedNoise &o1b,
+                                           uint32_t lane, OutputBuffer<SeedPos> &outputs) {
+  const uint32_t z_index = lane >> 1, x_start = (lane & 1u) * 8u;
+  const int32_t z = input.z + (int32_t)(z_index * T::pos_step) + T::pos_offset;
+  const int32_t x_base = input.x + (int32_t)(x_start * T::pos_step) + T::pos_offset;
+  float vals[8];
+  const float4 *src = reinterpret_cast<const float4 *>(device_a_sums + (size_t)(input.aux - 1u) * 256 + lane * 8);
+  const float4 v0 = src[0], v1 = src[1];
+  vals[0] = v0.x; vals[1] = v0.y; vals[2] = v0.z; vals[3] = v0.w;
+  vals[4] = v1.x; vals[5] = v1.y; vals[6] = v1.z; vals[7] = v1.w;
+  joint_octave<chosen_continentalness_config.octaves_b[0]>(table, o0b, x_base, z, vals);
+  joint_octave<chosen_continentalness_config.octaves_b[1]>(table, o1b, x_base, z, vals);
+  uint32_t local_count = 0;
+#pragma unroll
+  for (uint32_t k = 0; k < 8; k++) { local_count += (vals[k] < (float)TUNE_JOINT_LEVEL) ? 1u : 0u; }
+  const uint32_t total = warp_reduce_add(local_count);
+  if (lane == 0 && total >= TUNE_JOINT_B) {
+    uint32_t result_index = atomicAdd(outputs.len, 1);
+    if (result_index < outputs.max_len) {
+      outputs.data[result_index] = {input.seed_index, input.x, input.z};
+    }
+  }
+}
+
+__global__ __launch_bounds__(threads_per_block) void joint_pre_kernel(InputBuffer<SeedPos> inputs, OutputBuffer<SeedPos> outputs, KernelSeed1::Result *results) {
+  __shared__ GradDotTable shared_grad_dot_table;
+  __shared__ ImprovedNoise s_ob[warps_per_block][2][2];   // [warp][half][0B, 1B]
+  __shared__ ImprovedNoise s_oa[warps_per_block][2];      // 0A, 1A for inputs without stored sums
+
+  for (uint32_t i = threadIdx.x; i < sizeof(shared_grad_dot_table) / sizeof(uint32_t); i += threads_per_block) {
+    reinterpret_cast<uint32_t *>(&shared_grad_dot_table)[i] = reinterpret_cast<uint32_t *>(&device_grad_dot_table)[i];
+  }
+  __syncthreads();
+
+  const uint32_t lane = threadIdx.x & 31u, half = lane >> 4, l16 = lane & 15u;
+  const uint32_t w = threadIdx.x >> 5;
+  const uint32_t warp_global = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const uint32_t num_warps = (gridDim.x * blockDim.x) >> 5;
+  constexpr uint32_t words = sizeof(ImprovedNoise) / sizeof(uint32_t);
+
+  const uint32_t inputs_len = *inputs.len;
+  for (uint32_t base = warp_global * 2; base < inputs_len; base += num_warps * 2) {
+    const uint32_t my = base + half;
+    const bool valid = my < inputs_len;
+    SeedPos input{0, 0, 0, 0};
+    if (valid) {
+      input = inputs.data[my];
+      const KernelSeed1::Result &res = results[input.seed_index];
+      const uint32_t *s0 = reinterpret_cast<const uint32_t *>(&res.continentalness_0B), *s1 = reinterpret_cast<const uint32_t *>(&res.continentalness_1B);
+      uint32_t *d0 = reinterpret_cast<uint32_t *>(&s_ob[w][half][0]), *d1 = reinterpret_cast<uint32_t *>(&s_ob[w][half][1]);
+      for (uint32_t i = l16; i < words; i += 16) { d0[i] = s0[i]; d1[i] = s1[i]; }
+    }
+    __syncwarp();
+    const bool stored = valid && input.aux != 0u && input.aux - 1u < a_sums_cap;
+    uint32_t cnt = 0;
+    if (stored) {
+      const uint32_t zi = 4u * (l16 >> 2) + 1u, xi0 = 4u * (l16 & 3u);
+      const int32_t z = input.z + (int32_t)(zi * T::pos_step) + T::pos_offset;
+      const int32_t x_base = input.x + (int32_t)(xi0 * T::pos_step) + T::pos_offset;
+      const float4 a = *reinterpret_cast<const float4 *>(device_a_sums + (size_t)(input.aux - 1u) * 256 + zi * 16 + xi0);
+      float vals[4] = {a.x, a.y, a.z, a.w};
+      joint_octave<chosen_continentalness_config.octaves_b[0], 4>(shared_grad_dot_table, s_ob[w][half][0], x_base, z, vals);
+      joint_octave<chosen_continentalness_config.octaves_b[1], 4>(shared_grad_dot_table, s_ob[w][half][1], x_base, z, vals);
+#pragma unroll
+      for (uint32_t k = 0; k < 4; k++) cnt += (vals[k] < (float)TUNE_JOINT_LEVEL) ? 1u : 0u;
+    }
+    cnt += __shfl_xor_sync(0xFFFFFFFFu, cnt, 8);
+    cnt += __shfl_xor_sync(0xFFFFFFFFu, cnt, 4);
+    cnt += __shfl_xor_sync(0xFFFFFFFFu, cnt, 2);
+    cnt += __shfl_xor_sync(0xFFFFFFFFu, cnt, 1);
+    const bool go = valid && (!stored || cnt >= (uint32_t)TUNE_JOINT_PRE);
+    const uint32_t go_mask = __ballot_sync(0xFFFFFFFFu, go && l16 == 0);
+#pragma unroll
+    for (uint32_t h = 0; h < 2; h++) {
+      if (go_mask & (1u << (16 * h))) {
+        const SeedPos in2 = inputs.data[base + h];
+        if (in2.aux != 0u && in2.aux - 1u < a_sums_cap) {
+          joint_full(shared_grad_dot_table, in2, s_ob[w][h][0], s_ob[w][h][1], lane, outputs);
+        } else {
+          // no stored A sums (capacity): compute all four octaves
+          const KernelSeed1::Result &res = results[in2.seed_index];
+          const uint32_t *a0 = reinterpret_cast<const uint32_t *>(&res.continentalness_0A), *a1 = reinterpret_cast<const uint32_t *>(&res.continentalness_1A);
+          uint32_t *d0 = reinterpret_cast<uint32_t *>(&s_oa[w][0]), *d1 = reinterpret_cast<uint32_t *>(&s_oa[w][1]);
+          for (uint32_t i = lane; i < words; i += 32) { d0[i] = a0[i]; d1[i] = a1[i]; }
+          __syncwarp();
+          const uint32_t z_index = lane >> 1, x_start = (lane & 1u) * 8u;
+          const int32_t z = in2.z + (int32_t)(z_index * T::pos_step) + T::pos_offset;
+          const int32_t x_base = in2.x + (int32_t)(x_start * T::pos_step) + T::pos_offset;
+          float vals[8] = {};
+          joint_octave<chosen_continentalness_config.octaves_a[0]>(shared_grad_dot_table, s_oa[w][0], x_base, z, vals);
+          joint_octave<chosen_continentalness_config.octaves_b[0]>(shared_grad_dot_table, s_ob[w][h][0], x_base, z, vals);
+          joint_octave<chosen_continentalness_config.octaves_a[1]>(shared_grad_dot_table, s_oa[w][1], x_base, z, vals);
+          joint_octave<chosen_continentalness_config.octaves_b[1]>(shared_grad_dot_table, s_ob[w][h][1], x_base, z, vals);
+          uint32_t local_count = 0;
+#pragma unroll
+          for (uint32_t k = 0; k < 8; k++) { local_count += (vals[k] < (float)TUNE_JOINT_LEVEL) ? 1u : 0u; }
+          const uint32_t total = warp_reduce_add(local_count);
+          if (lane == 0 && total >= TUNE_JOINT_B) {
+            uint32_t result_index = atomicAdd(outputs.len, 1);
+            if (result_index < outputs.max_len) outputs.data[result_index] = {in2.seed_index, in2.x, in2.z};
+          }
+        }
+        __syncwarp();
+      }
+    }
+    __syncwarp();
+  }
+}
+#endif
 void run(InputBuffer<SeedPos> inputs, OutputBuffer<SeedPos> outputs, KernelSeed1::Result *results, cudaStream_t stream) {
-#if TUNE_JOINT_B
+#if TUNE_JOINT_B && TUNE_JOINT_PRE && TUNE_JOINT_REUSE_A
+  joint_pre_kernel<<<32 * 256, threads_per_block, 0, stream>>>(inputs, outputs, results);
+#elif TUNE_JOINT_B
   joint_kernel<<<32 * 256, threads_per_block, 0, stream>>>(inputs, outputs, results);
 #else
   kernel<<<32 * 256, threads_per_block, 0, stream>>>(inputs, outputs, results);
@@ -2909,7 +3071,7 @@ void GpuThread::run() {
               TUNE_A_MIN, TUNE_B_MIN, TUNE_MIN_2A, TUNE_MIN_2B, TUNE_MIN_2C, TUNE_MIN_2D);
   std::printf("tune: joint_b %d (level %g)  raw_fork %d  overlap %d  grid caps gv1 %d a %d per SM\n",
               TUNE_JOINT_B, (double)TUNE_JOINT_LEVEL, TUNE_RAW_FORK, TUNE_OVERLAP, TUNE_GV1_BPS, TUNE_A_BPS);
-  std::printf("tune: gv1_v2 %d  joint_reuse_a %d  hash_karg %d\n", TUNE_GV1_V2, TUNE_JOINT_REUSE_A, TUNE_HASH_KARG);
+  std::printf("tune: gv1_v2 %d  joint_reuse_a %d  hash_karg %d  joint_pre %d\n", TUNE_GV1_V2, TUNE_JOINT_REUSE_A, TUNE_HASH_KARG, TUNE_JOINT_PRE);
 #if TUNE_LOG_CANDIDATES
   std::FILE *cand_file = std::fopen((std::string("candidates-dev") + std::to_string(device) + ".txt").c_str(), "a");
 #else

@@ -2,7 +2,7 @@
 // any threshold setting can be applied offline:  island found  <=>  phase <= P  and some lineage passes every stage.
 //
 //   lineage < islands      islands: "seed x z area" (blocks); output one line per lineage:
-//   seed area phase  nx nz gate8 final8  amin  gv2gate gv2final  joint  c2a c2b c2c c2d
+//   seed area phase  nx nz gate8 final8  amin  gv2gate gv2final  joint  c2a c2b c2c c2d  j64 j16  d0A d0B d1A d1B d2A d2B  P0 P1 Ob Ot (gv1 term groups)
 //
 // A lineage is an octave-0A lattice cell within 2 cells of the island (modulo the stack-A period), followed to
 // its periodic image nearest the island. Cascade counts are computed only for lineages that pass loose bounds
@@ -31,10 +31,11 @@ static void gv1_ctx(Seed &s, GV1Ctx &c) {
     int ny = int(o.yo);
     for (int n = 0; n < 262; n++) for (int y = 0; y < 2; y++) c.idx[y][n] = o.p[(o.p[n & 255] + ny + y) & 255];
 }
-static void gv1_score(const GV1Ctx &c, int nx, int nz, float &gate, float &fin) {
+static void gv1_score(const GV1Ctx &c, int nx, int nz, float &gate, float &fin, float g[4]) {
     auto C = [&](int y, int i, int col) { return c.conv[y][(c.idx[y][nx + i] + nz) & 255][col]; };
     gate = C(0, 2, 1) + C(0, 3, 2);
     fin = (C(0, 2, 1) + C(0, 3, 2)) + C(0, 1, 0) + C(0, 4, 3) + C(1, 1, 0) + C(1, 2, 1) + C(1, 3, 2) + C(1, 4, 3);
+    g[0] = gate; g[1] = C(1, 2, 1) + C(1, 3, 2); g[2] = C(0, 1, 0) + C(0, 4, 3); g[3] = C(1, 1, 0) + C(1, 4, 3);
 }
 struct GV2Ctx { float conv[2][6][256]; };
 static void gv2_ctx(Seed &s, GV2Ctx &c) {
@@ -55,15 +56,29 @@ static void gv2_score(Seed &s, const GV2Ctx &c, int x, int z, float &gate, float
     gate = c.conv[0][2][(h[0][2] + row) & 255] + c.conv[0][3][(h[0][3] + row) & 255] + c.conv[1][2][(h[1][2] + row) & 255] + c.conv[1][3][(h[1][3] + row) & 255];
     fin = 0; for (int i = 0; i < 6; i++) { fin += c.conv[0][i][(h[0][i] + row) & 255]; fin += c.conv[1][i][(h[1][i] + row) & 255]; }
 }
-static int joint_count(Seed &s, int x, int z) {
-    int n = 0;
+// full count, and the counts on two 64-sample subsets: every other row and column, and rows 1, 5, 9, 13
+static int joint_count(Seed &s, int x, int z, int &j64, int &j16) {
+    int n = 0; j64 = 0; j16 = 0;
     for (int zi = 0; zi < 16; zi++)
         for (int xi = 0; xi < 16; xi++) {
             int px = x + xi * 128 - 960, pz = z + zi * 128 - 960;
             float v = octave(s, 0, px, pz) + octave(s, 1, px, pz) + octave(s, 2, px, pz) + octave(s, 3, px, pz);
-            n += v < -1.05f;
+            bool in = v < -1.05f;
+            n += in;
+            if (xi % 2 == 0 && zi % 2 == 0) j64 += in;
+            if (zi % 4 == 1) j16 += in;   // four whole rows (64 samples)
         }
     return n;
+}
+// distance of each octave's vertical offset from the middle of its lattice layer: 0A 0B 1A 1B 2A 2B
+static void phase_ds(const Seed &s, float d[6]) {
+    for (int side = 0; side < 2; side++)
+        for (int o = 0; o < 3; o++) {
+            const auto &salt = standalone::octave_salt[-9 + o + 10];
+            Random r(s.fa[side] ^ salt[0], s.fb[side] ^ salt[1]); r.next();
+            float f = float(uint32_t((r.next() >> 32) & 0xFFFFFF)) * 5.9604645E-8f;
+            d[o * 2 + side] = std::fabs(f - 0.5f);
+        }
 }
 static int casc(Seed &s, int noct, int range, int samples, bool move, Pos &p) {
     Pos q = p; if (!cascade(s, noct, range, samples, 1, move, q)) return 0; p = q; return q.count;
@@ -75,6 +90,7 @@ static std::string process(const std::string &line) {
     is >> area;
     Seed s{uint64_t(sd)};
     const float ph = phase_score(s);
+    float dd[6]; phase_ds(s, dd);
     GV1Ctx g1; gv1_ctx(s, g1); GV2Ctx g2; gv2_ctx(s, g2);
     const long P = 131072;   // stack-A period, biome units
     const long qx = bx >> 2, qz = bz >> 2;
@@ -86,15 +102,15 @@ static std::string process(const std::string &line) {
     for (int dx = -2; dx <= 2; dx++)
         for (int dz = -2; dz <= 2; dz++) {
             int nx = (cnx + dx) & 255, nz = (cnz + dz) & 255;
-            float gate, fin; gv1_score(g1, nx, nz, gate, fin);
+            float gate, fin, gg[4]; gv1_score(g1, nx, nz, gate, fin, gg);
             long ax = g1.xc + long(nx) * 512, az = g1.zc + long(nz) * 512;   // A candidate, biome units
             int amin = two_octave_count(s, 0, int(ax), int(az));
             long kx = std::lround(double(qx - ax) / P), kz = std::lround(double(qz - az) / P);
             long ix = ax + kx * P, iz = az + kz * P;                          // the image nearest the island
             float g2g, g2f; gv2_score(s, g2, int(ix), int(iz), g2g, g2f);
-            int j = -1, c2a = -1, c2b = -1, c2c = -1, c2d = -1;
+            int j = -1, c2a = -1, c2b = -1, c2c = -1, c2d = -1, j64 = -1, j16 = -1;
             if (fin > -18.f && amin >= 14 && g2f > -23.f) {
-                j = joint_count(s, int(ix), int(iz));
+                j = joint_count(s, int(ix), int(iz), j64, j16);
                 if (j >= 8) {
                     Pos r{int(ix), int(iz), 0};
                     c2a = casc(s, 12, 8192, 256, true, r);
@@ -103,8 +119,8 @@ static std::string process(const std::string &line) {
                     c2d = c2c ? casc(s, 18, 10240, 16384, false, r) : 0;
                 }
             }
-            snprintf(buf, sizeof buf, "%lld %.0f %.4f %d %d %.4f %.4f %d %.4f %.4f %d %d %d %d %d\n",
-                     sd, area, ph, nx, nz, gate, fin, amin, g2g, g2f, j, c2a, c2b, c2c, c2d);
+            snprintf(buf, sizeof buf, "%lld %.0f %.4f %d %d %.4f %.4f %d %.4f %.4f %d %d %d %d %d %d %d %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
+                     sd, area, ph, nx, nz, gate, fin, amin, g2g, g2f, j, c2a, c2b, c2c, c2d, j64, j16, dd[0], dd[1], dd[2], dd[3], dd[4], dd[5], gg[0], gg[1], gg[2], gg[3]);
             out += buf;
         }
     return out;

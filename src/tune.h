@@ -216,3 +216,14 @@
 #ifndef TUNE_HASH_KARG
 #define TUNE_HASH_KARG 0
 #endif
+
+// gradvecs_1 (kernel): packed lattice indices and an early exit after the bottom-layer terms when scoring
+// gate survivors. Same candidates.
+#ifndef TUNE_GV1_DRAIN2
+#define TUNE_GV1_DRAIN2 0
+#endif
+
+// Joint test pre-filter (needs TUNE_JOINT_REUSE_A): minimum count over 64 samples (4 rows) before the full test.
+#ifndef TUNE_JOINT_PRE
+#define TUNE_JOINT_PRE 0
+#endif
