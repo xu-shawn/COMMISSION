@@ -880,8 +880,13 @@ __global__ __launch_bounds__(threads_per_block) void late_kernel(InputBuffer<uin
     // read by filter_2_01b, so deferring it to the next stage is too late.
     init_octave_direct(noise, noise_b_fork, device_chosen_continentalness_config.octaves_b[0].fork_hash, results, &Result::continentalness_0B, seed_index);
     init_octave_direct(noise, noise_b_fork, device_chosen_continentalness_config.octaves_b[1].fork_hash, results, &Result::continentalness_1B, seed_index);
-    } else if constexpr (Stage == 2) {
+#if TUNE_A2_MIN
     init_octave_direct(noise, noise_a_fork, device_chosen_continentalness_config.octaves_a[2].fork_hash, results, &Result::continentalness_2A, seed_index);
+#endif
+    } else if constexpr (Stage == 2) {
+#if !TUNE_A2_MIN
+    init_octave_direct(noise, noise_a_fork, device_chosen_continentalness_config.octaves_a[2].fork_hash, results, &Result::continentalness_2A, seed_index);
+#endif
     init_octave_direct(noise, noise_a_fork, device_chosen_continentalness_config.octaves_a[3].fork_hash, results, &Result::continentalness_3A, seed_index);
     init_octave_direct(noise, noise_a_fork, device_chosen_continentalness_config.octaves_a[4].fork_hash, results, &Result::continentalness_4A, seed_index);
     init_octave_direct(noise, noise_a_fork, device_chosen_continentalness_config.octaves_a[5].fork_hash, results, &Result::continentalness_5A, seed_index);
@@ -1405,6 +1410,277 @@ __launch_bounds__(block_dim_x) void kernel(
   }
 }
 
+#if TUNE_GV1_V3
+__global__
+__launch_bounds__(block_dim_x) void kernel_v3(
+    const InputBuffer<uint64_t> seeds,
+    OutputBuffer<SeedPos> outputs,
+    const KernelSeed1::Result* __restrict__ results)
+{
+  // Double-buffered: each seed's noise struct is fetched while the previous
+  // seed is still being worked on. Loaded in place, the block stalled on this
+  // global read at a barrier once per seed -- measured at 1.10 ms of the
+  // stage, 4.8%, by pointing the load at a fixed always-cached address.
+  __shared__ alignas(16) ImprovedNoise oct_buf[2];
+  // Occupancy is at its optimum here and should be left alone. This block uses
+  // 17712 bytes of shared memory, which fits 5 blocks per SM (62% occupancy).
+  // Both neighbours were built and measured round-robin against it:
+  //
+  //   4 blocks / 50%  (padded to 20112 B)              gradvecs_1  +4.18%
+  //   5 blocks / 62%  (this)                           gradvecs_1   best
+  //   6 blocks / 75%  (staging only kernel columns 1-4
+  //                    for 16176 B, under the 16384
+  //                    needed for a 6th block)         gradvecs_1  +1.23%
+  //
+  // Dropping to 4 hurts, but buying a 6th block does not help -- the kernel is
+  // issue-bound, so extra resident warps have no latency left to hide, and the
+  // narrower staging costs a little address arithmetic. 5 is the peak.
+  __shared__ alignas(16) float shared_kernel_0A[6][6][16][2];
+
+  // only columns x = 1..4 carry information, but the row stride stays 6: at
+  // stride 6 the gate pair (x = 2, 3) sits at float offset 6i+2, always 8-byte
+  // aligned, so ptxas fuses the two loads into one LDS.U.64. A stride of 4 puts
+  // them at 4i+1 / 4i+2, never 8-byte aligned, which costs 54% on this kernel.
+  // Only kernel columns 1..4 are ever read, so the row is 5 wide, not 6, with
+  // column x stored at x-1 and one slot of padding. Two gains: 2048 fewer bytes
+  // of shared memory, and a stride of 5, which is coprime with the 32 shared
+  // banks -- since the candidate list made these reads random rather than
+  // consecutive, an odd stride reaches all 32 banks where 6 reached only 16.
+  //
+  // A tighter gate was tried on top of this and rejected. The bound here is
+  // one-sided: rows survive if A[t] >= T - max(B). Adding the mirror condition
+  // B[s] >= T - max(A) and keeping only pairs whose difference matches some nx's
+  // lag cuts the work from 65536 grid points to about 870 pairs -- 75x fewer,
+  // and 8.5x fewer than the one-sided list's 7398 checks. Both a prefix-summed
+  // CSR of nx-by-lag and fixed-capacity buckets were built, both bit-exact at
+  // 49137561 candidates, and both were worth almost nothing: -5.8% and -8.1% on
+  // this kernel against a predicted 3.6x. gradvecs_1 sees only ~4.5 hits per
+  // seed, so once the scan is down to 28 rows the per-seed bookkeeping -- two
+  // block-wide max reductions, two ballot compactions, the lag structure and its
+  // barriers -- costs more than the scan it removes. The one-sided list already
+  // takes essentially all of the available win.
+  __shared__ float conv_z0[256][5];
+  __shared__ float conv_z1[256][5];
+
+  __shared__ alignas(16) uint8_t idx_xy[2][272];
+  // The gate is A[t] + B[t+d] >= T with A = conv_z0[.][2] and B = conv_z0[.][3].
+  // B can never exceed max(B), so only t with A[t] >= T - max(B) can contribute
+  // to any candidate at all. Measured over random permutations, that is 11% of
+  // the 256 t values, so listing them cuts gate checks about ninefold with no
+  // loss -- every (t, d) that really passes is kept, verified exhaustively.
+  __shared__ uint8_t cand_t[256];
+  __shared__ float   cand_a[256];
+  __shared__ uint32_t cand_n;
+  // Queue of gate survivors awaiting their score, one per warp. The gate lets
+  // roughly 166 of a seed's 65536 positions through, scattered across the scan,
+  // so a warp reaching the score path carries less than one live lane on
+  // average -- measured, the score path is 69% of this kernel while the scan
+  // that feeds it is 1%. Staging the survivors and draining 32 at a time runs
+  // that work at full width instead. Depth 64: a drain leaves at most 31 behind
+  // and the next round can add 32.
+  // Gate survivors of the whole block, scored after the scan by all threads at once (see below).
+  constexpr uint32_t list_cap = 2048;
+  __shared__ uint16_t surv[list_cap];
+  __shared__ uint32_t surv_n;
+  __shared__ float   red_max[8];
+#if TUNE_GV1_DRAIN2
+  // the four lattice bytes a score reads per layer (offsets nx+1 .. nx+4), packed into one word
+  __shared__ uint32_t pk_idx[2][256];
+#endif
+
+  const int32_t nz = threadIdx.x;
+
+  for (uint32_t i = nz; i < 288; i += block_dim_x) {
+    reinterpret_cast<uint4*>(shared_kernel_0A)[i] =
+        reinterpret_cast<const uint4*>(device_kernel_0A)[i];
+  }
+
+  const uint32_t seeds_len = *seeds.len;
+
+  uint32_t buf = 0u;
+  if (blockIdx.x < seeds_len && nz < 17) {
+    reinterpret_cast<uint4*>(&oct_buf[0])[nz] =
+        reinterpret_cast<const uint4*>(&results[blockIdx.x].continentalness_0A)[nz];
+  }
+
+  for (uint32_t seed_index = blockIdx.x; seed_index < seeds_len; seed_index += gridDim.x) {
+    // This barrier both releases the shared tables from the previous seed and
+    // publishes the fetch issued during it, so the second barrier the in-place
+    // load needed is gone.
+    __syncthreads();
+
+    const uint32_t next_seed = seed_index + gridDim.x;
+    if (next_seed < seeds_len && nz < 17) {
+      reinterpret_cast<uint4*>(&oct_buf[buf ^ 1u])[nz] =
+          reinterpret_cast<const uint4*>(&results[next_seed].continentalness_0A)[nz];
+    }
+
+    const ImprovedNoise &oct_0A = oct_buf[buf];
+    buf ^= 1u;
+
+    {
+      uint32_t p_z[6];
+#pragma unroll
+      for (int32_t dnz = 0; dnz < 6; ++dnz) {
+        p_z[dnz] = oct_0A.p[(nz + dnz) & 0xFF] & 0xF;
+      }
+
+#pragma unroll
+      for (int32_t dnx = 1; dnx < 5; ++dnx) {
+        float conv0 = 0.0f;
+        float conv1 = 0.0f;
+
+#pragma unroll
+        for (int32_t dnz = 0; dnz < 6; ++dnz) {
+          const uint32_t p = p_z[dnz];
+          conv0 += shared_kernel_0A[dnx][dnz][p][0];
+          conv1 += shared_kernel_0A[dnx][dnz][p][1];
+        }
+
+        conv_z0[nz][dnx - 1] = conv0;
+        conv_z1[nz][dnx - 1] = conv1;
+      }
+    }
+
+    const int32_t cell_size = 512 * large_biomes_pos_mul;
+    const int32_t x_center = (2.5f - oct_0A.xo) * cell_size;
+    const int32_t ny = oct_0A.yo;
+    const int32_t z_center = (2.5f - oct_0A.zo) * cell_size;
+
+    const uint8_t idx_x = oct_0A.p[nz];
+    const uint8_t v0 = oct_0A.p[(idx_x + ny) & 0xFF];
+    const uint8_t v1 = oct_0A.p[(idx_x + ny + 1) & 0xFF];
+    idx_xy[0][nz] = v0;
+    idx_xy[1][nz] = v1;
+
+    if (nz < 6) {
+      idx_xy[0][256 + nz] = v0;
+      idx_xy[1][256 + nz] = v1;
+    }
+
+    if (nz == 0) { cand_n = 0; surv_n = 0; }
+    __syncthreads();
+
+#if TUNE_GV1_DRAIN2
+    pk_idx[0][nz] = (uint32_t)idx_xy[0][nz + 1] | ((uint32_t)idx_xy[0][nz + 2] << 8) | ((uint32_t)idx_xy[0][nz + 3] << 16) | ((uint32_t)idx_xy[0][nz + 4] << 24);
+    pk_idx[1][nz] = (uint32_t)idx_xy[1][nz + 1] | ((uint32_t)idx_xy[1][nz + 2] << 8) | ((uint32_t)idx_xy[1][nz + 3] << 16) | ((uint32_t)idx_xy[1][nz + 4] << 24);
+#endif
+    // max over B = conv_z0[.][3], reduced across the block
+    {
+      float m = conv_z0[nz][2];
+#pragma unroll
+      for (int off = 16; off; off >>= 1) {
+        m = fmaxf(m, __shfl_down_sync(0xFFFFFFFFu, m, off));
+      }
+      if ((nz & 31) == 0) { red_max[nz >> 5] = m; }
+    }
+    __syncthreads();
+    float max_b = red_max[0];
+#pragma unroll
+    for (int k = 1; k < 8; ++k) { max_b = fmaxf(max_b, red_max[k]); }
+
+    // list the t values that could still clear the gate
+    {
+      const float a = conv_z0[nz][1];
+      // Slack, because the bound is applied in floating point: fl(a + b) can
+      // reach the threshold when a sits just under fl(T - max_b). Values here
+      // are order 10, so an ulp is ~1e-6; 1e-3 is far more than enough and
+      // widens the list by a negligible amount.
+      const bool keep = (a >= kGradVecs1GateZ0Threshold - max_b - 1.0e-3f);
+      const uint32_t m = __ballot_sync(0xFFFFFFFFu, keep);
+      uint32_t base;
+      if ((nz & 31) == 0) { base = atomicAdd(&cand_n, __popc(m)); }
+      base = __shfl_sync(0xFFFFFFFFu, base, 0);
+      if (keep) {
+        const uint32_t slot = base + __popc(m & ((1u << (nz & 31)) - 1u));
+        cand_t[slot] = (uint8_t)nz;
+        cand_a[slot] = a;
+      }
+    }
+    __syncthreads();
+    const uint32_t n_cand = cand_n;
+
+    // One thread per nx now, rather than per nz: nx fixes the four y=0 and four
+    // y=1 lattice offsets for the whole seed, so they are read once into
+    // registers instead of being re-derived by a sliding window.
+    const uint32_t nx = nz;
+    const uint32_t warp = nz >> 5, lane = nz & 31;
+    const uint32_t p1 = idx_xy[0][nx + 1], p2 = idx_xy[0][nx + 2];
+    const uint32_t p3 = idx_xy[0][nx + 3], p4 = idx_xy[0][nx + 4];
+    const uint32_t q1 = idx_xy[1][nx + 1], q2 = idx_xy[1][nx + 2];
+    const uint32_t q3 = idx_xy[1][nx + 3], q4 = idx_xy[1][nx + 4];
+    const uint32_t d = (p3 - p2) & 0xFF;
+    const int32_t x = x_center + (int32_t)nx * cell_size;
+
+    // score of one survivor (nx, t): same terms and summation order as `kernel`
+    auto score_one = [&](uint32_t nxv, uint32_t t_) {
+      const uint32_t r1 = idx_xy[0][nxv + 1], r2 = idx_xy[0][nxv + 2];
+      const uint32_t r3 = idx_xy[0][nxv + 3], r4 = idx_xy[0][nxv + 4];
+      const uint32_t s1 = idx_xy[1][nxv + 1], s2 = idx_xy[1][nxv + 2];
+      const uint32_t s3 = idx_xy[1][nxv + 3], s4 = idx_xy[1][nxv + 4];
+      const uint32_t nzv = (t_ - r2) & 0xFF;
+      const float sc = (conv_z0[(r2 + nzv) & 0xFF][1]
+                      + conv_z0[(r3 + nzv) & 0xFF][2])
+                     + conv_z0[(r1 + nzv) & 0xFF][0]
+                     + conv_z0[(r4 + nzv) & 0xFF][3]
+                     + conv_z1[(s1 + nzv) & 0xFF][0]
+                     + conv_z1[(s2 + nzv) & 0xFF][1]
+                     + conv_z1[(s3 + nzv) & 0xFF][2]
+                     + conv_z1[(s4 + nzv) & 0xFF][3];
+      if (sc > kGradVecs1FinalThreshold) {
+        uint32_t ri_ = atomicAdd(outputs.len, 1);
+        if (ri_ < outputs.max_len) {
+          outputs.data[ri_] = {seed_index, x_center + (int32_t)nxv * cell_size, z_center + (int32_t)nzv * cell_size};
+        }
+      }
+    };
+
+    // Survivors go to one block-wide list instead of per-warp queues drained 32 at a time inside the scan:
+    // the drains were chains of dependent shared loads interleaved with the scan, which Pascal could not hide.
+    for (uint32_t base = 0; base < n_cand; base += 32u) {
+      const uint32_t n_this = (n_cand - base) < 32u ? (n_cand - base) : 32u;
+      uint32_t hitmask = 0u;
+      for (uint32_t j = 0; j < n_this; ++j) {
+        const uint32_t t = cand_t[base + j];
+        const float    a = cand_a[base + j];
+        const float    b = conv_z0[(t + d) & 0xFF][2];
+        if (a + b >= kGradVecs1GateZ0Threshold) { hitmask |= (1u << j); }
+      }
+      // warp-aggregated append: exclusive scan of the per-lane hit counts, one shared atomic per warp
+      const uint32_t c = __popc(hitmask);
+      uint32_t incl = c;
+#pragma unroll
+      for (int off = 1; off < 32; off <<= 1) {
+        const uint32_t v = __shfl_up_sync(0xFFFFFFFFu, incl, off);
+        if ((int)lane >= off) incl += v;
+      }
+      const uint32_t total = __shfl_sync(0xFFFFFFFFu, incl, 31);
+      if (total == 0u) continue;
+      uint32_t wbase = 0;
+      if (lane == 31) wbase = atomicAdd(&surv_n, total);
+      wbase = __shfl_sync(0xFFFFFFFFu, wbase, 31);
+      uint32_t slot = wbase + incl - c;
+      while (hitmask) {
+        const uint32_t j = (uint32_t)__ffs((int)hitmask) - 1u;
+        hitmask &= hitmask - 1u;
+        const uint32_t t_ = cand_t[base + j];
+        if (slot < list_cap) { surv[slot] = (uint16_t)((nx << 8) | t_); }
+        else { score_one(nx, t_); }   // list full (rare): score in place
+        slot++;
+      }
+    }
+    __syncthreads();
+    {
+      const uint32_t n_surv = surv_n < list_cap ? surv_n : list_cap;
+      for (uint32_t i = nz; i < n_surv; i += block_dim_x) {
+        const uint32_t e_ = surv[i];
+        score_one(e_ >> 8, e_ & 0xFFu);
+      }
+    }
+  }
+}
+
+#endif
 #if TUNE_GV1_V2
 // Same candidates as `kernel`, scanned the other way round.
 //
@@ -1631,7 +1907,9 @@ void run(
   // TUNE_GV1_BPS > 0 caps the grid at that many blocks per SM, which leaves room on every SM for blocks of the
   // seed hashing running beside it (TUNE_OVERLAP)
   static const int blocks = TUNE_GV1_BPS > 0 ? device_sms() * TUNE_GV1_BPS : 4096;
-#if TUNE_GV1_V2
+#if TUNE_GV1_V3
+  kernel_v3<<<blocks, block_dim_x, 0, stream>>>(seeds, outputs, results);
+#elif TUNE_GV1_V2
   kernel_v2<<<blocks, block_dim_x, 0, stream>>>(seeds, outputs, results);
 #else
   kernel<<<blocks, block_dim_x, 0, stream>>>(seeds, outputs, results);
@@ -2180,6 +2458,9 @@ void Template<NoiseThreshold, Octaves, PosRange, Samples, MinCount, FlippedSpars
 // large image coordinates bring.)
 constexpr uint32_t a_sums_cap = UINT32_C(1) << 16;
 __device__ float *device_a_sums;
+#if TUNE_A2_MIN
+__device__ float *device_a_sums2;   // the same sums, re-indexed by the A2 filter's outputs (what gradvecs_2 tags)
+#endif
 #endif
 // cactus was here :)
 namespace KernelFilter2_0A {
@@ -2687,6 +2968,11 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos>
   }
 }
 
+#if TUNE_A2_MIN
+#define JOINT_A_SUMS device_a_sums2
+#else
+#define JOINT_A_SUMS device_a_sums
+#endif
 #if TUNE_JOINT_B
 // Joint replacement for the B-side test. Everything before gradvecs_2 sees one noise stack at a time, and on
 // its own each stack's octaves 0-1 say little about how large an island becomes; together they do. On the same
@@ -2723,6 +3009,83 @@ __device__ __forceinline__ void joint_octave(const GradDotTable &table, const Im
   }
 }
 
+#endif   // TUNE_JOINT_B (helpers)
+#if TUNE_A2_MIN && TUNE_JOINT_REUSE_A
+// Full-A screen of the A candidates. Stack A repeats exactly at every periodic image, so its octaves above 1 are
+// as fixed for a candidate as octaves 0-1 are, and gradvecs_2 then spends 109,561 (unbounded) B pairings on it.
+// Adding octave 2A to filter_2_01a's stored 0A + 1A sums and counting samples below -0.55 ranks candidates far
+// better than the 0A + 1A count alone: on 24,000 islands from long runs, keeping half of the candidates kept 96-100%
+// of the islands at every size. Fitted with the A count loosened to 25: about 5% more islands per unit time in
+// unbounded large biomes.
+__global__ __launch_bounds__(threads_per_block) void a2_kernel(InputBuffer<SeedPos> inputs, OutputBuffer<SeedPos> outputs, KernelSeed1::Result *results) {
+  __shared__ GradDotTable shared_grad_dot_table;
+  __shared__ ImprovedNoise s_oct[warps_per_block];
+  for (uint32_t i = threadIdx.x; i < sizeof(shared_grad_dot_table) / sizeof(uint32_t); i += threads_per_block) {
+    reinterpret_cast<uint32_t *>(&shared_grad_dot_table)[i] = reinterpret_cast<uint32_t *>(&device_grad_dot_table)[i];
+  }
+  __syncthreads();
+  const uint32_t lane = threadIdx.x & 31u, w = threadIdx.x >> 5;
+  const uint32_t warp_global = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const uint32_t num_warps = (gridDim.x * blockDim.x) >> 5;
+  const uint32_t z_index = lane >> 1, x_start = (lane & 1u) * 8u;
+  constexpr uint32_t words = sizeof(ImprovedNoise) / sizeof(uint32_t);
+  const uint32_t inputs_len = *inputs.len;
+  for (uint32_t input_index = warp_global; input_index < inputs_len; input_index += num_warps) {
+    const SeedPos input = inputs.data[input_index];
+    const int32_t z = input.z + (int32_t)(z_index * T::pos_step) + T::pos_offset;
+    const int32_t x_base = input.x + (int32_t)(x_start * T::pos_step) + T::pos_offset;
+    float4 v0, v1;
+    if (input_index < a_sums_cap) {
+      const float4 *src = reinterpret_cast<const float4 *>(device_a_sums + (size_t)input_index * 256 + lane * 8);
+      v0 = src[0]; v1 = src[1];
+    } else {   // beyond the stored sums (never seen in practice): octaves 0A + 1A from scratch
+      float a01[8] = {};
+      const uint32_t *s0 = reinterpret_cast<const uint32_t *>(&results[input.seed_index].continentalness_0A);
+      uint32_t *dst = reinterpret_cast<uint32_t *>(&s_oct[w]);
+      for (uint32_t i = lane; i < words; i += 32) dst[i] = s0[i];
+      __syncwarp();
+      joint_octave<chosen_continentalness_config.octaves_a[0]>(shared_grad_dot_table, s_oct[w], x_base, z, a01);
+      __syncwarp();
+      const uint32_t *s1 = reinterpret_cast<const uint32_t *>(&results[input.seed_index].continentalness_1A);
+      for (uint32_t i = lane; i < words; i += 32) dst[i] = s1[i];
+      __syncwarp();
+      joint_octave<chosen_continentalness_config.octaves_a[1]>(shared_grad_dot_table, s_oct[w], x_base, z, a01);
+      __syncwarp();
+      v0 = make_float4(a01[0], a01[1], a01[2], a01[3]); v1 = make_float4(a01[4], a01[5], a01[6], a01[7]);
+    }
+    {
+      const uint32_t *src = reinterpret_cast<const uint32_t *>(&results[input.seed_index].continentalness_2A);
+      uint32_t *dst = reinterpret_cast<uint32_t *>(&s_oct[w]);
+      for (uint32_t i = lane; i < words; i += 32) dst[i] = src[i];
+    }
+    __syncwarp();
+    float vals[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+    joint_octave<chosen_continentalness_config.octaves_a[2]>(shared_grad_dot_table, s_oct[w], x_base, z, vals);
+    uint32_t local = 0;
+#pragma unroll
+    for (uint32_t k = 0; k < 8; k++) local += (vals[k] < -0.55f) ? 1u : 0u;
+    const uint32_t total = __shfl_sync(0xFFFFFFFFu, warp_reduce_add(local), 0);
+    if (total >= (uint32_t)TUNE_A2_MIN) {
+      uint32_t ri = 0;
+      if (lane == 0) {
+        ri = atomicAdd(outputs.len, 1);
+        if (ri < outputs.max_len) outputs.data[ri] = {input.seed_index, input.x, input.z};
+      }
+      ri = __shfl_sync(0xFFFFFFFFu, ri, 0);
+      if (ri < a_sums_cap) {   // carry the 0A + 1A sums to the output's index for the joint test
+        float4 *dst = reinterpret_cast<float4 *>(device_a_sums2 + (size_t)ri * 256 + lane * 8);
+        dst[0] = v0; dst[1] = v1;
+      }
+    }
+    __syncwarp();
+  }
+}
+void run_a2(InputBuffer<SeedPos> inputs, OutputBuffer<SeedPos> outputs, KernelSeed1::Result *results, cudaStream_t stream) {
+  a2_kernel<<<32 * 64, threads_per_block, 0, stream>>>(inputs, outputs, results);
+  TRY_CUDA(cudaGetLastError());
+}
+#endif
+#if TUNE_JOINT_B
 __global__ __launch_bounds__(threads_per_block) void joint_kernel(InputBuffer<SeedPos> inputs, OutputBuffer<SeedPos> outputs, KernelSeed1::Result *results) {
   __shared__ GradDotTable shared_grad_dot_table;
   __shared__ ImprovedNoise s_oct[warps_per_block][4];
@@ -2763,7 +3126,7 @@ __global__ __launch_bounds__(threads_per_block) void joint_kernel(InputBuffer<Se
     float vals[8] = {};
 #if TUNE_JOINT_REUSE_A
     if (input.aux != 0u && input.aux - 1u < a_sums_cap) {
-      const float4 *src = reinterpret_cast<const float4 *>(device_a_sums + (size_t)(input.aux - 1u) * 256 + lane * 8);
+      const float4 *src = reinterpret_cast<const float4 *>(JOINT_A_SUMS + (size_t)(input.aux - 1u) * 256 + lane * 8);
       const float4 v0 = src[0], v1 = src[1];
       vals[0] = v0.x; vals[1] = v0.y; vals[2] = v0.z; vals[3] = v0.w;
       vals[4] = v1.x; vals[5] = v1.y; vals[6] = v1.z; vals[7] = v1.w;
@@ -2805,7 +3168,7 @@ __device__ __forceinline__ void joint_full(const GradDotTable &table, const Seed
   const int32_t z = input.z + (int32_t)(z_index * T::pos_step) + T::pos_offset;
   const int32_t x_base = input.x + (int32_t)(x_start * T::pos_step) + T::pos_offset;
   float vals[8];
-  const float4 *src = reinterpret_cast<const float4 *>(device_a_sums + (size_t)(input.aux - 1u) * 256 + lane * 8);
+  const float4 *src = reinterpret_cast<const float4 *>(JOINT_A_SUMS + (size_t)(input.aux - 1u) * 256 + lane * 8);
   const float4 v0 = src[0], v1 = src[1];
   vals[0] = v0.x; vals[1] = v0.y; vals[2] = v0.z; vals[3] = v0.w;
   vals[4] = v1.x; vals[5] = v1.y; vals[6] = v1.z; vals[7] = v1.w;
@@ -2858,7 +3221,7 @@ __global__ __launch_bounds__(threads_per_block) void joint_pre_kernel(InputBuffe
       const uint32_t zi = 4u * (l16 >> 2) + 1u, xi0 = 4u * (l16 & 3u);
       const int32_t z = input.z + (int32_t)(zi * T::pos_step) + T::pos_offset;
       const int32_t x_base = input.x + (int32_t)(xi0 * T::pos_step) + T::pos_offset;
-      const float4 a = *reinterpret_cast<const float4 *>(device_a_sums + (size_t)(input.aux - 1u) * 256 + zi * 16 + xi0);
+      const float4 a = *reinterpret_cast<const float4 *>(JOINT_A_SUMS + (size_t)(input.aux - 1u) * 256 + zi * 16 + xi0);
       float vals[4] = {a.x, a.y, a.z, a.w};
       joint_octave<chosen_continentalness_config.octaves_b[0], 4>(shared_grad_dot_table, s_ob[w][half][0], x_base, z, vals);
       joint_octave<chosen_continentalness_config.octaves_b[1], 4>(shared_grad_dot_table, s_ob[w][half][1], x_base, z, vals);
@@ -3016,6 +3379,7 @@ struct BufferLens {
   uint32_t results_len_filter_2_0b;
   uint32_t results_len_filter_gradvecs_2;
   uint32_t results_len_filter_2[7];
+  uint32_t results_len_a2;
 };
 
 
@@ -3032,6 +3396,9 @@ void GpuThread::run() {
 #if TUNE_GV1_V2
   TRY_CUDA(cudaFuncSetAttribute(KernelFilterGradVecs1::kernel_v2, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
 #endif
+#if TUNE_GV1_V3
+  TRY_CUDA(cudaFuncSetAttribute(KernelFilterGradVecs1::kernel_v3, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+#endif
   init_grad_dot_table();
   init_conv_kernels();
 #if TUNE_JOINT_REUSE_A
@@ -3039,6 +3406,11 @@ void GpuThread::run() {
     float *a_sums;
     TRY_CUDA(cudaMalloc(&a_sums, sizeof(float) * 256 * a_sums_cap));
     TRY_CUDA(cudaMemcpyToSymbol(device_a_sums, &a_sums, sizeof(a_sums)));
+#if TUNE_A2_MIN
+    float *a_sums2;
+    TRY_CUDA(cudaMalloc(&a_sums2, sizeof(float) * 256 * a_sums_cap));
+    TRY_CUDA(cudaMemcpyToSymbol(device_a_sums2, &a_sums2, sizeof(a_sums2)));
+#endif
   }
 #endif
 
@@ -3071,7 +3443,7 @@ void GpuThread::run() {
               TUNE_A_MIN, TUNE_B_MIN, TUNE_MIN_2A, TUNE_MIN_2B, TUNE_MIN_2C, TUNE_MIN_2D);
   std::printf("tune: joint_b %d (level %g)  raw_fork %d  overlap %d  grid caps gv1 %d a %d per SM\n",
               TUNE_JOINT_B, (double)TUNE_JOINT_LEVEL, TUNE_RAW_FORK, TUNE_OVERLAP, TUNE_GV1_BPS, TUNE_A_BPS);
-  std::printf("tune: gv1_v2 %d  joint_reuse_a %d  hash_karg %d  joint_pre %d\n", TUNE_GV1_V2, TUNE_JOINT_REUSE_A, TUNE_HASH_KARG, TUNE_JOINT_PRE);
+  std::printf("tune: gv1_v2 %d  joint_reuse_a %d  hash_karg %d  joint_pre %d  a2_min %d\n", TUNE_GV1_V2, TUNE_JOINT_REUSE_A, TUNE_HASH_KARG, TUNE_JOINT_PRE, TUNE_A2_MIN);
 #if TUNE_LOG_CANDIDATES
   std::FILE *cand_file = std::fopen((std::string("candidates-dev") + std::to_string(device) + ".txt").c_str(), "a");
 #else
@@ -3111,7 +3483,14 @@ void GpuThread::run() {
 
   OutputBuffer<SeedPos> outputs_filter_gradvecs_2(buffer_2, &device_buffer_lens->results_len_filter_gradvecs_2);
   auto &stage_init_seeds_0b = stage_stats.emplace_back("init_seeds_0b", stage_filter_2_0a.outputs_len, stage_filter_2_0a.outputs_len, 1, outputs_filter_2_0a.max_len);
+#if TUNE_A2_MIN
+  DeviceBuffer buffer_a2(UINT32_C(1) << 24);
+  OutputBuffer<SeedPos> outputs_a2(buffer_a2, &device_buffer_lens->results_len_a2);
+  auto &stage_a2 = stage_stats.emplace_back("filter_a2", stage_filter_2_0a.outputs_len, &host_buffer_lens.results_len_a2, 1, outputs_a2.max_len);
+  auto &stage_filter_gradvecs_2 = stage_stats.emplace_back("filter_gradvecs_2", stage_a2.outputs_len, &host_buffer_lens.results_len_filter_gradvecs_2, KernelFilterGradVecs2::threads_per_seed, outputs_filter_gradvecs_2.max_len);
+#else
   auto &stage_filter_gradvecs_2 = stage_stats.emplace_back("filter_gradvecs_2", stage_filter_2_0a.outputs_len, &host_buffer_lens.results_len_filter_gradvecs_2, KernelFilterGradVecs2::threads_per_seed, outputs_filter_gradvecs_2.max_len);
+#endif
 
   // filter_2_01b reads the gradvecs_2 outputs from buffer_2, so it must not write there too: warps take their
   // inputs in grid-stride order, and one that has not yet read an early input can find it overwritten by
@@ -3220,8 +3599,16 @@ void GpuThread::run() {
     TRY_CUDA(cudaMemsetAsync(buffer_late_init_flags.data, 0, sizeof(uint32_t) * KernelSeed1::threads_per_run, stream));
     KernelSeed1::run_late<1>(outputs_filter_seeds, outputs_filter_2_0a, results, (uint32_t *)buffer_late_init_flags.data, stream);
     stage_init_seeds_0b.record(stream);
+#if TUNE_A2_MIN
+    KernelFilter2_0B::run_a2(outputs_filter_2_0a, outputs_a2, results, stream);
+    stage_a2.record(stream);
+#endif
 
+#if TUNE_A2_MIN
+    KernelFilterGradVecs2::run(outputs_a2, outputs_filter_gradvecs_2, results, stream);
+#else
     KernelFilterGradVecs2::run(outputs_filter_2_0a, outputs_filter_gradvecs_2, results, stream);
+#endif
     stage_filter_gradvecs_2.record(stream);
 
     filter_2_0B_run(outputs_filter_gradvecs_2, outputs_filter_2_0b, results, stream);

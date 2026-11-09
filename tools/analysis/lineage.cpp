@@ -7,7 +7,7 @@
 // A lineage is an octave-0A lattice cell within 2 cells of the island (modulo the stack-A period), followed to
 // its periodic image nearest the island. Cascade counts are computed only for lineages that pass loose bounds
 // (final8 > -18, amin >= 14, gv2final > -23, joint >= 8); others print -1 there.
-#include "cpipe.hpp"
+#include "afull.hpp"
 #include <cstdio>
 #include <iostream>
 #include <sstream>
@@ -105,6 +105,8 @@ static std::string process(const std::string &line) {
             float gate, fin, gg[4]; gv1_score(g1, nx, nz, gate, fin, gg);
             long ax = g1.xc + long(nx) * 512, az = g1.zc + long(nz) * 512;   // A candidate, biome units
             int amin = two_octave_count(s, 0, int(ax), int(az));
+            int af[12] = {0}; float am = 0;
+            if (fin > -17.f && amin >= 22) afull_stats(s, int(ax), int(az), af, am);
             long kx = std::lround(double(qx - ax) / P), kz = std::lround(double(qz - az) / P);
             long ix = ax + kx * P, iz = az + kz * P;                          // the image nearest the island
             float g2g, g2f; gv2_score(s, g2, int(ix), int(iz), g2g, g2f);
@@ -119,8 +121,8 @@ static std::string process(const std::string &line) {
                     c2d = c2c ? casc(s, 18, 10240, 16384, false, r) : 0;
                 }
             }
-            snprintf(buf, sizeof buf, "%lld %.0f %.4f %d %d %.4f %.4f %d %.4f %.4f %d %d %d %d %d %d %d %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
-                     sd, area, ph, nx, nz, gate, fin, amin, g2g, g2f, j, c2a, c2b, c2c, c2d, j64, j16, dd[0], dd[1], dd[2], dd[3], dd[4], dd[5], gg[0], gg[1], gg[2], gg[3]);
+            snprintf(buf, sizeof buf, "%lld %.0f %.4f %d %d %.4f %.4f %d %.4f %.4f %d %d %d %d %d %d %d %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f  %.4f %d %d %d %d %d %d %d %d %d %d %d %d\n",
+                     sd, area, ph, nx, nz, gate, fin, amin, g2g, g2f, j, c2a, c2b, c2c, c2d, j64, j16, dd[0], dd[1], dd[2], dd[3], dd[4], dd[5], gg[0], gg[1], gg[2], gg[3], am, af[0], af[1], af[2], af[3], af[4], af[5], af[6], af[7], af[8], af[9], af[10], af[11]);
             out += buf;
         }
     return out;

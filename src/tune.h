@@ -234,3 +234,15 @@
 #ifndef TUNE_JOINT_PRE
 #define TUNE_JOINT_PRE 0
 #endif
+
+// Full-A screen (needs TUNE_JOINT_REUSE_A): minimum count of the 256 samples where octaves 0A + 1A + 2A are below
+// -0.55, applied to filter_2_01a's outputs before gradvecs_2 (0 = off). Pair with a looser TUNE_A_MIN (25).
+#ifndef TUNE_A2_MIN
+#define TUNE_A2_MIN 0
+#endif
+
+// gradvecs_1 with a block-wide list of gate survivors, scored after the scan by all threads (kernel_v3). Same
+// candidates as `kernel`.
+#ifndef TUNE_GV1_V3
+#define TUNE_GV1_V3 0
+#endif
