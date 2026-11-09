@@ -261,7 +261,9 @@ L_end:
 
 int cubiomes_test_monte_carlo(Cubiomes *cubiomes, int32_t x, int32_t z, int32_t range, int32_t min_area, double confidence) {
     Range r = make_range(x, z, range, 4);
-    double fraction = (double)min_area / (r.sx * r.sz * r.scale * r.scale);
+    // in double: for large biomes the window is 12800 x 12800 cells at scale 4, and the product
+    // (2,621,440,000) overflows an int, which made the pre-test accept every candidate
+    double fraction = (double)min_area / ((double)r.sx * r.sz * r.scale * r.scale);
     uint64_t rng = cubiomes->g.seed;
     return monteCarloBiomes(&cubiomes->g, r, &rng, fraction, confidence, eval, NULL);
 }
