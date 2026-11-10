@@ -18,5 +18,8 @@ g++ -O3 -march=native -std=c++20 -pthread NAME.cpp -o NAME
 | `joint.cpp` | The joint octave-0/1 statistics used by `TUNE_JOINT_B`, at the gradvecs_2 outputs of islands (`joint islands`) or of random seeds (`joint random N`). |
 | `phasecorr.cpp`, `gaterecall.cpp` | Correlation of the octaves' y-offsets through the RNG; recall and pass rate of phase gates under the island density of `docs/search-economics.md`. |
 | `nodes.cpp` | Vertical-gradient classes of the central octave-0A nodes at islands. |
+| `hashlean_check.cpp` | Host replay of `TUNE_HASH_LEAN`: the integer windows that decide staging in the seed hashing keep every seed the float gate passes (all 2^24 fractions, then chain seeds against `noise.hpp` seeding); pass rates of the staging tests. Build with `-ffp-contract=off` for the bit-exact comparison. |
+| `gv1banks.cpp` | Shared-memory wavefronts per B load, checks and hit-loop passes of the gradvecs_1 gate scan in each kernel layout, on random permutations; `gv1banks verify` replays `TUNE_GV1_LEAN`'s scan against the reference gate. |
+| `afirst.cpp` | filter_2_01a's counts after 1..8 samples per lane walking each half row from the centre (`TUNE_A_EARLY`), for the gradvecs_1 outputs of random seeds or for listed lattice positions. |
 
 Island lists are "seed x z [area]" lines in block coordinates (`verify_largest` output can be cut to that).
