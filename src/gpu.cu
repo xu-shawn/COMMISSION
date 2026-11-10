@@ -1480,6 +1480,12 @@ __launch_bounds__(block_dim_x) void kernel(
   // and the next round can add 32.
 #if TUNE_GV1_LEAN
   __shared__ uint16_t score_q[block_dim_x / 32][64];   // (column << 8) + list position: 16 bits
+#if TUNE_GV1_DRAIN3
+  // TUNE_GV1_DRAIN3: survivors of the central-four bound wait here for the full score: (column << 8) + row offset,
+  // and the gate pair's sum exactly as the score adds it first
+  __shared__ uint16_t q2_pos[block_dim_x / 32][64];
+  __shared__ float    q2_p0[block_dim_x / 32][64];
+#endif
 #else
   __shared__ uint32_t score_q[block_dim_x / 32][64];
 #endif
@@ -1763,6 +1769,73 @@ __launch_bounds__(block_dim_x) void kernel(
         }                                                                        \
       }                                                                          \
     }
+#elif TUNE_GV1_LEAN && TUNE_GV1_DRAIN3
+    // Two-level drain. Every term of the score is <= 0, so the central four terms (the gate pair, then layer 1's
+    // x = 2 and 3) bound it from above: only about 29% of gate hits pass that bound. Level 1 computes the bound
+    // with a margin far above float rounding (1e-3 against ~3e-5) and queues the survivors with their gate-pair
+    // sum; level 2 adds the remaining terms in the original order, so every score is bit-identical to the
+    // one-level drain and the outputs are the same.
+#define OMISSION_SCORE2(ACTIVE)                                                  \
+    {                                                                            \
+      const uint32_t act2_ = (ACTIVE);                                           \
+      if (lane < act2_) {                                                        \
+        const uint32_t ps_ = q2_pos[warp][lane];                                 \
+        const uint32_t nxv = ps_ >> 8, nzv = ps_ & 0xFFu;                        \
+        const uint32_t r1 = idx_xy[0][nxv + 1], r4 = idx_xy[0][nxv + 4];         \
+        const uint32_t s1 = idx_xy[1][nxv + 1], s2 = idx_xy[1][nxv + 2];         \
+        const uint32_t s3 = idx_xy[1][nxv + 3], s4 = idx_xy[1][nxv + 4];         \
+        const float sc = q2_p0[warp][lane]                                      \
+                       + OMISSION_CZ0((r1 + nzv) & 0xFF, 0)                     \
+                       + OMISSION_CZ0((r4 + nzv) & 0xFF, 3)                     \
+                       + OMISSION_CZ1((s1 + nzv) & 0xFF, 0)                     \
+                       + OMISSION_CZ1((s2 + nzv) & 0xFF, 1)                     \
+                       + OMISSION_CZ1((s3 + nzv) & 0xFF, 2)                     \
+                       + OMISSION_CZ1((s4 + nzv) & 0xFF, 3);                    \
+        if (sc > fin_thr) {                                                      \
+          uint32_t ri_ = atomicAdd(outputs.len, 1);                              \
+          if (ri_ < outputs.max_len) {                                           \
+            outputs.data[ri_] = {seed_index,                                     \
+                                 x_center + (int32_t)nxv * cell_size,            \
+                                 z_center + (int32_t)nzv * cell_size};           \
+          }                                                                      \
+        }                                                                        \
+      }                                                                          \
+    }
+#define OMISSION_SCORE_DRAIN(ACTIVE)                                             \
+    {                                                                            \
+      const uint32_t act_ = (ACTIVE);                                            \
+      bool keep_ = false; uint32_t pos_ = 0u; float p0v_ = 0.0f;                 \
+      if (lane < act_) {                                                         \
+        const uint32_t e_ = score_q[warp][lane];                                 \
+        const uint32_t nxv = e_ >> 8, t_ = (uint32_t)cand_t[e_ & 0xFFu];         \
+        const uint32_t r2 = idx_xy[0][nxv + 2], r3 = idx_xy[0][nxv + 3];         \
+        const uint32_t s2 = idx_xy[1][nxv + 2], s3 = idx_xy[1][nxv + 3];         \
+        const uint32_t nzv = (t_ - r2) & 0xFF;                                   \
+        const float p0_ = OMISSION_CZ0((r2 + nzv) & 0xFF, 1)                    \
+                        + OMISSION_CZ0((r3 + nzv) & 0xFF, 2);                   \
+        const float c4_ = (p0_ + OMISSION_CZ1((s2 + nzv) & 0xFF, 1))            \
+                        + OMISSION_CZ1((s3 + nzv) & 0xFF, 2);                   \
+        keep_ = (p0_ >= kGradVecs1GateZ0Threshold) && (c4_ > fin_thr - 1.0e-3f); \
+        pos_ = (nxv << 8) | nzv; p0v_ = p0_;                                     \
+      }                                                                          \
+      const uint32_t km_ = __ballot_sync(0xFFFFFFFFu, keep_);                    \
+      if (keep_) {                                                               \
+        const uint32_t sl_ = q2_n + __popc(km_ & lanemask_lt);                   \
+        q2_pos[warp][sl_] = (uint16_t)pos_; q2_p0[warp][sl_] = p0v_;             \
+      }                                                                          \
+      q2_n += __popc(km_);                                                       \
+      if (q2_n >= 32u) {                                                         \
+        __syncwarp();                                                            \
+        OMISSION_SCORE2(32u)                                                     \
+        __syncwarp();                                                            \
+        q2_n -= 32u;                                                             \
+        if (lane < q2_n) {                                                       \
+          q2_pos[warp][lane] = q2_pos[warp][lane + 32];                          \
+          q2_p0[warp][lane] = q2_p0[warp][lane + 32];                            \
+        }                                                                        \
+        __syncwarp();                                                            \
+      }                                                                          \
+    }
 #else
 #if TUNE_GV1_LEAN
 // the scan's test is a superset of the gate; p0_ is the same sum of the same two floats the gate adds
@@ -1807,6 +1880,9 @@ __launch_bounds__(block_dim_x) void kernel(
 #endif
 
     uint32_t sq_n = 0;   // uniform across the warp
+#if TUNE_GV1_LEAN && TUNE_GV1_DRAIN3
+    uint32_t q2_n = 0;   // second-level queue length, uniform across the warp
+#endif
 #if TUNE_GV1_EXP == 12 || TUNE_GV1_EXP == 13
     uint32_t exp_sink = 0;
 #endif
@@ -1892,6 +1968,13 @@ __launch_bounds__(block_dim_x) void kernel(
       __syncwarp();
       OMISSION_SCORE_DRAIN(sq_n)
     }
+#if TUNE_GV1_LEAN && TUNE_GV1_DRAIN3
+    if (q2_n != 0u) {
+      __syncwarp();
+      OMISSION_SCORE2(q2_n)
+    }
+#undef OMISSION_SCORE2
+#endif
 #if TUNE_GV1_EXP == 12 || TUNE_GV1_EXP == 13
     if (exp_sink == 0xFFFFFFFFu) atomicAdd(outputs.len, 0);
 #endif

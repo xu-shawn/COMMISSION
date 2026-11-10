@@ -405,3 +405,10 @@
 #ifndef TUNE_GV1_SORT
 #define TUNE_GV1_SORT 0
 #endif
+// gradvecs_1 (kernel with TUNE_GV1_LEAN): two-level drain of the gate hits. Level 1 bounds the score by its central
+// four terms (every term is <= 0) and queues the ~29% that pass; level 2 adds the other terms in the original order.
+// Same candidates, bit-identical scores. +3 KB of shared memory a block. Measured: 1.5% slower on Pascal, no
+// change on Turing (level 1 still reads half the score for every hit, and the second queue costs the rest).
+#ifndef TUNE_GV1_DRAIN3
+#define TUNE_GV1_DRAIN3 0
+#endif
