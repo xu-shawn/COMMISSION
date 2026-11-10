@@ -1461,7 +1461,15 @@ __launch_bounds__(block_dim_x) void kernel(
   // one candidate row as the scan wants it: byte offset of its row in bk, and the lowest B that can pass with it
   // (minus a margin: the survivors are tested against the exact float gate again when they are scored). One
   // 8-byte broadcast load per check, where cand_t and cand_a took one and a half.
-  __shared__ alignas(8) CandPk cand_pk[256 + 4];
+  __shared__ alignas(16) CandPk cand_pk[256 + 4];   // 16: TUNE_GV1_PAIR reads two entries per load
+#endif
+#if TUNE_GV1_SORT
+  // TUNE_GV1_SORT: columns are dealt to the warps by lag class (lag mod 32/K), so that most warps hold exactly K
+  // columns of every class and their B loads in the scan take one wavefront. col_of[thread] = the column it scans.
+  static_assert(TUNE_GV1_LEAN, "TUNE_GV1_SORT reorders the lean scan");
+  __shared__ uint8_t col_of[256];
+  __shared__ uint8_t sort_wcnt[8][32u / TUNE_GV1_LEAN];   // columns of each class per warp
+  __shared__ uint32_t sort_ccnt[32u / TUNE_GV1_LEAN];     // columns of each class in the block
 #endif
   // Queue of gate survivors awaiting their score, one per warp. The gate lets
   // roughly 166 of a seed's 65536 positions through, scattered across the scan,
@@ -1565,6 +1573,9 @@ __launch_bounds__(block_dim_x) void kernel(
       idx_xy[1][256 + nz] = v1;
     }
 
+#if TUNE_GV1_SORT
+    if (nz < 32u / TUNE_GV1_LEAN) { sort_ccnt[nz] = 0u; }
+#endif
     if (nz == 0) {
       cand_n = 0;
 #if TUNE_GV1_PHASE_ADAPT
@@ -1637,7 +1648,41 @@ __launch_bounds__(block_dim_x) void kernel(
 #endif
       }
     }
+#if TUNE_GV1_SORT
+    constexpr uint32_t sort_classes = 32u / TUNE_GV1_LEAN;
+    const uint32_t sort_cls = ((idx_xy[0][nz + 3] - idx_xy[0][nz + 2]) & 0xFFu) & (sort_classes - 1u);
+    uint32_t sort_rank = 0;   // among this warp's columns of the same class
+#pragma unroll
+    for (uint32_t c = 0; c < sort_classes; ++c) {
+      const uint32_t m = __ballot_sync(0xFFFFFFFFu, sort_cls == c);
+      if (sort_cls == c) { sort_rank = __popc(m & ((1u << (nz & 31)) - 1u)); }
+      if ((nz & 31) == 0) { sort_wcnt[nz >> 5][c] = (uint8_t)__popc(m); atomicAdd(&sort_ccnt[c], (uint32_t)__popc(m)); }
+    }
+#endif
     __syncthreads();
+#if TUNE_GV1_SORT
+    {
+      // k clean warps take K columns of every class (one wavefront per B load); the rest of the columns are dealt
+      // round-robin over the other 8 - k warps
+      uint32_t n_c[sort_classes], k = 8u;
+#pragma unroll
+      for (uint32_t c = 0; c < sort_classes; ++c) { n_c[c] = sort_ccnt[c]; k = min(k, n_c[c] / (uint32_t)TUNE_GV1_LEAN); }
+      uint32_t r = sort_rank;
+      for (uint32_t w = 0; w < (nz >> 5); ++w) { r += sort_wcnt[w][sort_cls]; }
+      uint32_t dest;
+      if (r < (uint32_t)TUNE_GV1_LEAN * k) {
+        dest = (r / TUNE_GV1_LEAN) * 32u + sort_cls * TUNE_GV1_LEAN + (r % TUNE_GV1_LEAN);
+      } else {
+        uint32_t pos = r - (uint32_t)TUNE_GV1_LEAN * k;
+#pragma unroll
+        for (uint32_t c = 0; c < sort_classes; ++c) { if (c < sort_cls) { pos += n_c[c] - (uint32_t)TUNE_GV1_LEAN * k; } }
+        const uint32_t nd = 8u - k;
+        dest = (k + pos % nd) * 32u + pos / nd;
+      }
+      col_of[dest] = (uint8_t)nz;
+    }
+    __syncthreads();
+#endif
     const float fin_thr = fin_thr_s;
 #if TUNE_GV1_EXP == 11
     const uint32_t n_cand = 0;   // timing experiment: setup only
@@ -1648,7 +1693,11 @@ __launch_bounds__(block_dim_x) void kernel(
     // One thread per nx now, rather than per nz: nx fixes the four y=0 and four
     // y=1 lattice offsets for the whole seed, so they are read once into
     // registers instead of being re-derived by a sliding window.
+#if TUNE_GV1_SORT
+    const uint32_t nx = col_of[nz];
+#else
     const uint32_t nx = nz;
+#endif
     const uint32_t warp = nz >> 5, lane = nz & 31;
     const uint32_t p1 = idx_xy[0][nx + 1], p2 = idx_xy[0][nx + 2];
     const uint32_t p3 = idx_xy[0][nx + 3], p4 = idx_xy[0][nx + 4];
@@ -1777,9 +1826,20 @@ __launch_bounds__(block_dim_x) void kernel(
       // Per check: one 8-byte broadcast load, add, mask, B load from this lane's copy, compare, merge the bit.
       for (uint32_t j = 0; j < n_this; j += 4u) {
         uint32_t nib = 0u;
+#if TUNE_GV1_PAIR
+        // two candidate rows per 16-byte broadcast load instead of one per 8-byte load
+        const uint4 w01 = reinterpret_cast<const uint4 *>(cand_pk)[(base + j) >> 1];
+        const uint4 w23 = reinterpret_cast<const uint4 *>(cand_pk)[((base + j) >> 1) + 1u];
+        const CandPk ev[4] = {{w01.x, __uint_as_float(w01.y)}, {w01.z, __uint_as_float(w01.w)},
+                              {w23.x, __uint_as_float(w23.y)}, {w23.z, __uint_as_float(w23.w)}};
+#endif
 #pragma unroll
         for (uint32_t q = 0; q < 4u; ++q) {
+#if TUNE_GV1_PAIR
+          const CandPk e = ev[q];
+#else
           const CandPk e = cand_pk[base + j + q];   // broadcast
+#endif
           const float b = *reinterpret_cast<const float *>(
               reinterpret_cast<const char *>(bk) + ((e.off + bk_lane) & (bk_bytes - 1u)));
           if (b >= e.thr) { nib |= (1u << q); }
@@ -2938,7 +2998,9 @@ void run(
     const KernelSeed1::Result* __restrict__ results,
     cudaStream_t stream)
 {
-  kernel<<<2048, block_dim_x, 0, stream>>>(inputs, outputs, results);
+  // TUNE_GV2_BPS > 0 caps the grid at that many blocks per SM, so the overlapped seed hashing keeps room beside it
+  static const int blocks = TUNE_GV2_BPS > 0 ? device_sms() * TUNE_GV2_BPS : 2048;
+  kernel<<<blocks, block_dim_x, 0, stream>>>(inputs, outputs, results);
   TRY_CUDA(cudaGetLastError());
 }
 } // namespace KernelFilterGradVecs2
@@ -4198,7 +4260,9 @@ void run(InputBuffer<SeedPos> inputs, OutputBuffer<SeedPos> outputs, KernelSeed1
 #if TUNE_JOINT_B && TUNE_JOINT_PRE && TUNE_JOINT_REUSE_A
   joint_pre_kernel<<<32 * 256, threads_per_block, 0, stream>>>(inputs, outputs, results);
 #elif TUNE_JOINT_B
-  joint_kernel<<<32 * 256, threads_per_block, 0, stream>>>(inputs, outputs, results);
+  // TUNE_JOINT_BPS > 0: the same grid cap for the joint test
+  static const int blocks = TUNE_JOINT_BPS > 0 ? device_sms() * TUNE_JOINT_BPS : 32 * 256;
+  joint_kernel<<<blocks, threads_per_block, 0, stream>>>(inputs, outputs, results);
 #else
   kernel<<<32 * 256, threads_per_block, 0, stream>>>(inputs, outputs, results);
 #endif

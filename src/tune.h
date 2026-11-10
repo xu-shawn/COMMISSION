@@ -387,3 +387,21 @@
 #ifndef TUNE_JOINT_NODES
 #define TUNE_JOINT_NODES 0
 #endif
+
+// gradvecs_1 (kernel with TUNE_GV1_LEAN): read the candidate rows two per 16-byte broadcast load. Same candidates.
+#ifndef TUNE_GV1_PAIR
+#define TUNE_GV1_PAIR 0
+#endif
+// grid caps (blocks per SM, 0 = the old fixed grids) for gradvecs_2 and the joint test: both kernels grid-stride, so
+// a smaller grid gives the same results and leaves room on every SM for the overlapped seed hashing
+#ifndef TUNE_GV2_BPS
+#define TUNE_GV2_BPS 0
+#endif
+#ifndef TUNE_JOINT_BPS
+#define TUNE_JOINT_BPS 0
+#endif
+// gradvecs_1 (kernel with TUNE_GV1_LEAN = K): deal the columns to the warps by lag class (lag mod 32/K) so most
+// warps hold K columns of each class and their B loads take one wavefront. Same candidates.
+#ifndef TUNE_GV1_SORT
+#define TUNE_GV1_SORT 0
+#endif
