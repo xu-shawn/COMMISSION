@@ -63,6 +63,7 @@ inline int __float2int_rd(float f) { return (int)std::floor(f); }
 inline int __popc(unsigned v) { return __builtin_popcount(v); }
 inline int __ffs(int v) { return __builtin_ffs(v); }
 inline float __uint_as_float(unsigned u) { float f; std::memcpy(&f, &u, 4); return f; }
+inline unsigned __float_as_uint(float f) { unsigned u; std::memcpy(&u, &f, 4); return u; }
 
 // host API: memory is ordinary memory, everything else does nothing
 typedef int cudaError_t; constexpr int cudaSuccess = 0;

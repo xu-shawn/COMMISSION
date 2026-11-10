@@ -53,7 +53,12 @@ int main(int argc, char **argv) {
     printf("A2 %u\n", lens.results_len_a2);
     OutputBuffer<SeedPos> out_g2(buffer_g2, &lens.results_len_filter_gradvecs_2);
     cuda_launch(KernelFilterGradVecs2::kernel, 16, KernelFilterGradVecs2::block_dim_x, 0, nullptr, InputBuffer<SeedPos>(out_a2), out_g2, results);
-    printf("GV2 %u\n", lens.results_len_filter_gradvecs_2);
+    { std::vector<std::tuple<long long, int, int, unsigned>> g;
+      for (uint32_t i = 0; i < lens.results_len_filter_gradvecs_2; i++) g.emplace_back((long long)seeds[out_g2.data[i].seed_index], out_g2.data[i].x, out_g2.data[i].z, out_g2.data[i].aux);
+      std::sort(g.begin(), g.end()); unsigned long long hsh = 1469598103934665603ull;
+      for (auto &t : g) { for (unsigned long long v : {(unsigned long long)std::get<0>(t), (unsigned long long)(unsigned)std::get<1>(t), (unsigned long long)(unsigned)std::get<2>(t)}) { hsh ^= v; hsh *= 1099511628211ull; } }
+      printf("GV2 %u %016llx\n", lens.results_len_filter_gradvecs_2, hsh);
+      if (getenv("DUMP_GV2")) for (auto &t : g) fprintf(stderr, "g %lld %d %d\n", std::get<0>(t), std::get<1>(t), std::get<2>(t)); }   // aux (the A candidate's buffer index) varies from run to run: left out
     OutputBuffer<SeedPos> out_j(buffer_j, &lens.results_len_filter_2_0b);
     cuda_launch(KernelFilter2_0B::joint_kernel, 16, 256, 0, nullptr, InputBuffer<SeedPos>(out_g2), out_j, results);
     const uint32_t nj = lens.results_len_filter_2_0b;

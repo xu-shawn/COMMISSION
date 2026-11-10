@@ -1457,7 +1457,13 @@ __launch_bounds__(block_dim_x) void kernel(
   constexpr uint32_t bk_copies = TUNE_GV1_LEAN;
   constexpr uint32_t bk_row_bytes = bk_copies * 4;
   constexpr uint32_t bk_bytes = 256 * bk_row_bytes;   // a power of two: row index wraps with one AND
+#if TUNE_GV1_BK2
+  // TUNE_GV1_BK2: the rows stored twice in a row (512 rows), so that row t + lag needs no wrap: one AND less per
+  // check and warp (a sixth of the scan's instructions) for 1 KiB of shared memory per copy
+  __shared__ alignas(16) float bk[512][bk_copies];
+#else
   __shared__ alignas(16) float bk[256][bk_copies];
+#endif
   // one candidate row as the scan wants it: byte offset of its row in bk, and the lowest B that can pass with it
   // (minus a margin: the survivors are tested against the exact float gate again when they are scored). One
   // 8-byte broadcast load per check, where cand_t and cand_a took one and a half.
@@ -1478,7 +1484,12 @@ __launch_bounds__(block_dim_x) void kernel(
   // that feeds it is 1%. Staging the survivors and draining 32 at a time runs
   // that work at full width instead. Depth 64: a drain leaves at most 31 behind
   // and the next round can add 32.
-#if TUNE_GV1_LEAN
+#if TUNE_GV1_LEAN && TUNE_GV1_HIT3
+  // TUNE_GV1_HIT3: up to three hits per lane leave the hit loop in one pass (96 entries at once), and the queue
+  // is scored from the top, so nothing is moved after a drain
+  static_assert(!TUNE_GV1_DRAIN3 && !TUNE_GV1_SORT, "TUNE_GV1_HIT3 is written for the plain lean drain");
+  __shared__ uint16_t score_q[block_dim_x / 32][128];
+#elif TUNE_GV1_LEAN
   __shared__ uint16_t score_q[block_dim_x / 32][64];   // (column << 8) + list position: 16 bits
 #if TUNE_GV1_DRAIN3
   // TUNE_GV1_DRAIN3: survivors of the central-four bound wait here for the full score: (column << 8) + row offset,
@@ -1558,6 +1569,10 @@ __launch_bounds__(block_dim_x) void kernel(
           b_own = conv0;
 #pragma unroll
           for (uint32_t c = 0; c < bk_copies; ++c) { bk[nz][c] = conv0; }
+#if TUNE_GV1_BK2
+#pragma unroll
+          for (uint32_t c = 0; c < bk_copies; ++c) { bk[256 + nz][c] = conv0; }
+#endif
         }
 #endif
       }
@@ -1722,11 +1737,23 @@ __launch_bounds__(block_dim_x) void kernel(
     uint32_t bk_copy = 0;
     {
       const uint32_t cls = d & (32u / bk_copies - 1u);
+#if TUNE_GV1_RANKBITS
+      // TUNE_GV1_RANKBITS: the lanes of this lane's class from one ballot per bit of the class (3 for K = 4)
+      // instead of one per class (8)
+      uint32_t same = 0xFFFFFFFFu;
+#pragma unroll
+      for (uint32_t bit = 1u; bit < 32u / bk_copies; bit <<= 1) {
+        const uint32_t m = __ballot_sync(0xFFFFFFFFu, (cls & bit) != 0u);
+        same &= (cls & bit) ? m : ~m;
+      }
+      bk_copy = __popc(same & ((1u << lane) - 1u)) & (bk_copies - 1u);
+#else
 #pragma unroll
       for (uint32_t r = 0; r < 32u / bk_copies; ++r) {
         const uint32_t m = __ballot_sync(0xFFFFFFFFu, cls == r);
         if (cls == r) { bk_copy = __popc(m & ((1u << lane) - 1u)) & (bk_copies - 1u); }
       }
+#endif
     }
     const uint32_t bk_lane = d * bk_row_bytes + bk_copy * 4u;   // byte offset of row d, this lane's copy
     // never-passing entries up to a multiple of four, so the scan runs in fours with constant bit positions.
@@ -1847,11 +1874,16 @@ __launch_bounds__(block_dim_x) void kernel(
 #define OMISSION_GATE_RECHECK
 #define OMISSION_Q_ROW(E) ((E) & 0xFFu)
 #endif
+#if TUNE_GV1_LEAN && TUNE_GV1_HIT3
+#define OMISSION_Q_BASE (sq_n - act_)
+#else
+#define OMISSION_Q_BASE 0u
+#endif
 #define OMISSION_SCORE_DRAIN(ACTIVE)                                             \
     {                                                                            \
       const uint32_t act_ = (ACTIVE);                                            \
       if (lane < act_) {                                                         \
-        const uint32_t e_ = score_q[warp][lane];                                 \
+        const uint32_t e_ = score_q[warp][OMISSION_Q_BASE + lane];               \
         const uint32_t nxv = e_ >> 8, t_ = OMISSION_Q_ROW(e_);                   \
         const uint32_t r1 = idx_xy[0][nxv + 1], r2 = idx_xy[0][nxv + 2];         \
         const uint32_t r3 = idx_xy[0][nxv + 3], r4 = idx_xy[0][nxv + 4];         \
@@ -1916,8 +1948,12 @@ __launch_bounds__(block_dim_x) void kernel(
 #else
           const CandPk e = cand_pk[base + j + q];   // broadcast
 #endif
+#if TUNE_GV1_BK2
+          const float b = *reinterpret_cast<const float *>(reinterpret_cast<const char *>(bk) + (e.off + bk_lane));
+#else
           const float b = *reinterpret_cast<const float *>(
               reinterpret_cast<const char *>(bk) + ((e.off + bk_lane) & (bk_bytes - 1u)));
+#endif
           if (b >= e.thr) { nib |= (1u << q); }
         }
         hitmask |= nib << j;
@@ -1934,6 +1970,38 @@ __launch_bounds__(block_dim_x) void kernel(
 #if TUNE_GV1_EXP == 12 || TUNE_GV1_EXP == 13
       exp_sink += __popc(hitmask); hitmask = 0u;   // timing experiment: scan without queue or score
 #endif
+#if TUNE_GV1_LEAN && TUNE_GV1_HIT3
+      // Up to three hits per lane per pass: the first hits of all lanes, then the second, then the third (a lane
+      // has 1.3 hits per 32 candidates on average and the busiest of a warp about four, so two passes do what
+      // took four or five).
+      for (;;) {
+        const uint32_t c_ = __popc(hitmask);
+        const uint32_t m1 = __ballot_sync(0xFFFFFFFFu, c_ >= 1u);
+        if (m1 == 0u) { break; }
+        const uint32_t m2 = __ballot_sync(0xFFFFFFFFu, c_ >= 2u);
+        const uint32_t m3 = __ballot_sync(0xFFFFFFFFu, c_ >= 3u);
+        const uint32_t n1 = sq_n + __popc(m1), n2 = n1 + __popc(m2);
+        if (c_ >= 1u) {
+          score_q[warp][sq_n + __popc(m1 & lanemask_lt)] = (uint16_t)((nx << 8) + (base + (uint32_t)__ffs((int)hitmask) - 1u));
+          hitmask &= hitmask - 1u;
+        }
+        if (c_ >= 2u) {
+          score_q[warp][n1 + __popc(m2 & lanemask_lt)] = (uint16_t)((nx << 8) + (base + (uint32_t)__ffs((int)hitmask) - 1u));
+          hitmask &= hitmask - 1u;
+        }
+        if (c_ >= 3u) {
+          score_q[warp][n2 + __popc(m3 & lanemask_lt)] = (uint16_t)((nx << 8) + (base + (uint32_t)__ffs((int)hitmask) - 1u));
+          hitmask &= hitmask - 1u;
+        }
+        sq_n = n2 + __popc(m3);
+        while (sq_n >= 32u) {
+          __syncwarp();
+          OMISSION_SCORE_DRAIN(32u)
+          __syncwarp();
+          sq_n -= 32u;
+        }
+      }
+#else
       // Drains one hit per lane per pass, so this runs as many times as the
       // busiest lane in the warp has hits -- about three, against n_cand
       // ballots before. Every lane stays in the loop until the ballot is empty,
@@ -1962,6 +2030,7 @@ __launch_bounds__(block_dim_x) void kernel(
           __syncwarp();
         }
       }
+#endif
     }
 
     if (sq_n != 0u) {
@@ -1979,6 +2048,7 @@ __launch_bounds__(block_dim_x) void kernel(
     if (exp_sink == 0xFFFFFFFFu) atomicAdd(outputs.len, 0);
 #endif
 #undef OMISSION_SCORE_DRAIN
+#undef OMISSION_Q_BASE
 #ifdef OMISSION_GATE_RECHECK
 #undef OMISSION_GATE_RECHECK
 #undef OMISSION_Q_ROW
@@ -1987,6 +2057,452 @@ __launch_bounds__(block_dim_x) void kernel(
 #undef OMISSION_CZ1
   }
 }
+
+#if TUNE_GV1_JOIN
+// TUNE_GV1_JOIN (kernel_v5): the same candidates as `kernel`, with the gate evaluated as a join of two row lists.
+//
+// `kernel` checks every listed row t (A[t] >= T - max B, a fifth of the rows) in all 256 columns: 13,000 checks
+// a seed, each a B load at an address of the lane's own, for 660 passes. The gate A[t] + B[u] >= T also needs
+// B[u] >= T - max A, again a fifth of the rows, so only 2,600 pairs (t, u) can pass at all, and a pair belongs to
+// the columns whose lag i0[nx + 3] - i0[nx + 2] is u - t (one column per lag on average, none for 37%).
+//
+// A warp has the B list on its lanes (consecutive words, or registers) and takes one A row per step: one compare
+// per 32 pairs. A lane whose pair passes looks up the columns of the pair's lag and queues (column, row); the
+// queue is scored 32 at a time from the top by the arithmetic of `kernel`, and no entry is moved. The B list
+// stores B's bits with the row in the low 8 bits (256 ulps at most), and the pair test has a margin for that;
+// every survivor is tested against the exact gate when it is scored, as with TUNE_GV1_LEAN.
+// The columns of one lag are chained with an atomic exchange (lag_head, lag_next). Without bit 8 a lane queues
+// the first column, and a scored entry whose column has a successor goes back into the queue with it. With bit 8
+// the first three columns of a lag are packed into one word and queued together.
+// Three barriers a seed, as `kernel`. Shared memory: 19.7 to 20.7 KB a block (22.3 KB with bit 8); 20,232 B with
+// bits 1+2+4+32, so that three blocks and two blocks of the seed hashing with TUNE_HASH_LEAN 2 share a 96 KiB SM.
+static_assert(!TUNE_GV1_PHASE_ADAPT && !TUNE_GV1_GATE_LAYER, "TUNE_GV1_JOIN is written for the plain gate");
+static_assert(TUNE_GV1_Z0_GATE > -15.0f, "the margin of the pair test assumes |B| < 16");
+struct JoinA { uint32_t t; float thr; };
+__global__
+__launch_bounds__(block_dim_x) void kernel_v5(
+    const InputBuffer<uint64_t> seeds,
+    OutputBuffer<SeedPos> outputs,
+    const KernelSeed1::Result* __restrict__ results)
+{
+  constexpr uint32_t kNone = 0xFFFFFFFFu;
+  __shared__ alignas(16) ImprovedNoise oct_buf[2];
+  __shared__ alignas(16) float shared_kernel_0A[4][6][16][2];   // kernel columns 1..4
+  __shared__ float conv_t[8][256];                // [k]: layer 0, x = k + 1; [4 + k]: layer 1
+  __shared__ alignas(16) uint8_t idx_xy[2][272];
+  __shared__ alignas(16) JoinA cand_a[256];       // A rows that can pass: row, lowest passing B (minus the margin)
+  __shared__ uint32_t cand_b[256 + 32];           // B rows that can pass: B's bits, row in the low 8; padded with -inf
+  __shared__ uint32_t lag_head[256];              // last column filed under each lag (kNone: no column)
+#if !(TUNE_GV1_JOIN & 2) || (TUNE_GV1_JOIN & 8)
+  __shared__ uint16_t lag_next[256];              // the column filed before it under the same lag (>= 256: none)
+#endif                                            // (with bit 2 alone the link is in the column's packed word)
+  __shared__ uint32_t pk_idx[2][256];             // a column's four lattice bytes per layer (offsets nx+1 .. nx+4)
+#if TUNE_GV1_JOIN & 8
+  static_assert(!(TUNE_GV1_JOIN & (32 | 64)), "TUNE_GV1_JOIN bit 8 is not combined with bits 32 and 64");
+  // bit 8: a lag's columns in one word: count (1..3) in bits 0-1, bit 2 if the lag has more than three, then the
+  // three columns. A step can add 96 entries to the queue.
+  __shared__ uint32_t lag_pk[256];
+  __shared__ uint16_t score_q[block_dim_x / 32][128];  // (column << 8) + row
+#elif TUNE_GV1_JOIN & (32 | 64)
+  static_assert(!(TUNE_GV1_JOIN & 32) || (TUNE_GV1_JOIN & 4), "TUNE_GV1_JOIN bit 32 pairs the two B chunks held in registers (bit 4)");
+  __shared__ uint16_t score_q[block_dim_x / 32][96];   // a step adds up to 64 (bit 32); room for the tail's successors (bit 64)
+#else
+  __shared__ uint16_t score_q[block_dim_x / 32][64];
+#endif
+  __shared__ uint32_t cand_n[2];
+  __shared__ float red_max[2][8];
+
+  const uint32_t nz = threadIdx.x, warp = nz >> 5, lane = nz & 31u;
+  const uint32_t lanemask_lt = (1u << lane) - 1u;
+
+  for (uint32_t i = nz; i < 4 * 48; i += block_dim_x) {   // 48 16-byte words per kernel column
+    reinterpret_cast<uint4*>(shared_kernel_0A)[i] =
+        reinterpret_cast<const uint4*>(&device_kernel_0A[1][0][0][0])[i];
+  }
+
+  const uint32_t seeds_len = *seeds.len;
+  uint32_t buf = 0u;
+  if (blockIdx.x < seeds_len && nz < 17) {
+    reinterpret_cast<uint4*>(&oct_buf[0])[nz] =
+        reinterpret_cast<const uint4*>(&results[blockIdx.x].continentalness_0A)[nz];
+  }
+  lag_head[nz] = kNone;
+
+  for (uint32_t seed_index = blockIdx.x; seed_index < seeds_len; seed_index += gridDim.x) {
+    __syncthreads();   // releases the previous seed's tables and publishes the fetch issued during it
+
+    const uint32_t next_seed = seed_index + gridDim.x;
+    if (next_seed < seeds_len && nz < 17) {
+      reinterpret_cast<uint4*>(&oct_buf[buf ^ 1u])[nz] =
+          reinterpret_cast<const uint4*>(&results[next_seed].continentalness_0A)[nz];
+    }
+    const ImprovedNoise &oct_0A = oct_buf[buf];
+    buf ^= 1u;
+
+    // ---- tables: this row's eight sums, the lattice bytes of this column, the warp's maxima of A and B
+    float a_own = 0.0f, b_own = 0.0f;
+    {
+      uint32_t p_z[6];
+#pragma unroll
+      for (int32_t dnz = 0; dnz < 6; ++dnz) {
+        p_z[dnz] = oct_0A.p[(nz + dnz) & 0xFF] & 0xF;
+      }
+#pragma unroll
+      for (int32_t dnx = 1; dnx < 5; ++dnx) {
+        float conv0 = 0.0f;
+        float conv1 = 0.0f;
+#pragma unroll
+        for (int32_t dnz = 0; dnz < 6; ++dnz) {
+          const uint32_t p = p_z[dnz];
+          conv0 += shared_kernel_0A[dnx - 1][dnz][p][0];
+          conv1 += shared_kernel_0A[dnx - 1][dnz][p][1];
+        }
+        conv_t[dnx - 1][nz] = conv0;
+        conv_t[4 + dnx - 1][nz] = conv1;
+        if (dnx == 2) { a_own = conv0; }
+        if (dnx == 3) { b_own = conv0; }
+      }
+    }
+    const int32_t cell_size = 512 * large_biomes_pos_mul;
+    const int32_t x_center = (2.5f - oct_0A.xo) * cell_size;
+    const int32_t ny = oct_0A.yo;
+    const int32_t z_center = (2.5f - oct_0A.zo) * cell_size;
+#if TUNE_GV1_JOIN & 8
+    // With bit 8 the chains are built here, so that the packed words can be made after the next barrier: this
+    // thread files column nz - 2, whose lag is i0[nz + 1] - i0[nz] (the neighbour's byte comes by shuffle).
+    uint32_t lag_col, lag_d, lag_prev;
+#endif
+    {
+      const uint8_t idx_x = oct_0A.p[nz];
+      const uint8_t v0 = oct_0A.p[(idx_x + ny) & 0xFF];
+      const uint8_t v1 = oct_0A.p[(idx_x + ny + 1) & 0xFF];
+      idx_xy[0][nz] = v0;
+      idx_xy[1][nz] = v1;
+      if (nz < 6) {
+        idx_xy[0][256 + nz] = v0;
+        idx_xy[1][256 + nz] = v1;
+      }
+#if TUNE_GV1_JOIN & 8
+      uint32_t v0n = __shfl_down_sync(0xFFFFFFFFu, (uint32_t)v0, 1);
+      if (lane == 31u) { v0n = oct_0A.p[(oct_0A.p[(nz + 1u) & 0xFFu] + ny) & 0xFF]; }
+      lag_col = (nz - 2u) & 0xFFu;
+      lag_d = (v0n - (uint32_t)v0) & 0xFFu;
+      lag_prev = atomicExch(&lag_head[lag_d], lag_col);
+      lag_next[lag_col] = (uint16_t)lag_prev;
+      lag_pk[nz] = 0u;
+#endif
+    }
+    if (nz < 2) { cand_n[nz] = 0; }
+#if !(TUNE_GV1_JOIN & 8)
+    lag_head[nz] = kNone;
+#endif
+    {
+      float ma = a_own, mb = b_own;
+#pragma unroll
+      for (int off = 16; off; off >>= 1) {
+        ma = fmaxf(ma, __shfl_down_sync(0xFFFFFFFFu, ma, off));
+        mb = fmaxf(mb, __shfl_down_sync(0xFFFFFFFFu, mb, off));
+      }
+      if (lane == 0) { red_max[0][warp] = ma; red_max[1][warp] = mb; }
+    }
+    __syncthreads();
+
+    // ---- the two row lists, this column's packed lattice bytes, and the chains of columns with one lag
+    {
+      float max_a = red_max[0][0], max_b = red_max[1][0];
+#pragma unroll
+      for (int k = 1; k < 8; ++k) { max_a = fmaxf(max_a, red_max[0][k]); max_b = fmaxf(max_b, red_max[1][k]); }
+      // Slack as in `kernel`: fl(a + b) can reach the threshold when a sits just under fl(T - max_b); the same
+      // holds for b against max_a (a pass has b >= T - a - ulp >= T - max_a - 1e-3).
+      const bool keep_a = (a_own >= kGradVecs1GateZ0Threshold - max_b - 1.0e-3f);
+      const bool keep_b = (b_own >= kGradVecs1GateZ0Threshold - max_a - 1.0e-3f);
+      const uint32_t m_a = __ballot_sync(0xFFFFFFFFu, keep_a);
+      const uint32_t m_b = __ballot_sync(0xFFFFFFFFu, keep_b);
+      uint32_t base_a = 0, base_b = 0;
+      if (lane == 0) { base_a = atomicAdd(&cand_n[0], __popc(m_a)); base_b = atomicAdd(&cand_n[1], __popc(m_b)); }
+      base_a = __shfl_sync(0xFFFFFFFFu, base_a, 0);
+      base_b = __shfl_sync(0xFFFFFFFFu, base_b, 0);
+      // The pair test compares B', B with its low 8 bits replaced (|B' - B| < 256 ulp < 2.5e-4 for |B| < 16),
+      // against (T - a) - 1e-3: fl(a + b) >= T gives b >= T - a - 1e-5, so B' >= T - a - 2.6e-4 passes it.
+      if (keep_a) { cand_a[base_a + __popc(m_a & lanemask_lt)] = {nz, (kGradVecs1GateZ0Threshold - a_own) - 1.0e-3f}; }
+      if (keep_b) { cand_b[base_b + __popc(m_b & lanemask_lt)] = (__float_as_uint(b_own) & 0xFFFFFF00u) | nz; }
+
+      const uint32_t r1 = idx_xy[0][nz + 1], r2 = idx_xy[0][nz + 2], r3 = idx_xy[0][nz + 3], r4 = idx_xy[0][nz + 4];
+      const uint32_t s1 = idx_xy[1][nz + 1], s2 = idx_xy[1][nz + 2], s3 = idx_xy[1][nz + 3], s4 = idx_xy[1][nz + 4];
+#if TUNE_GV1_JOIN & 8
+      // the last column filed under a lag packs the lag's first three
+      if (lag_head[lag_d] == lag_col) {
+        uint32_t c2 = kNone, c3 = kNone;
+        if (lag_prev < 256u) { c2 = lag_next[lag_prev]; }
+        if (c2 < 256u) { c3 = lag_next[c2]; }
+        lag_pk[lag_d] = (1u + (lag_prev < 256u ? 1u : 0u) + (c2 < 256u ? 1u : 0u)) | (c3 < 256u ? 4u : 0u)
+                      | (lag_col << 8) | ((lag_prev & 0xFFu) << 16) | ((c2 & 0xFFu) << 24);
+      }
+      const uint32_t prev = nz;
+#else
+      const uint32_t prev = atomicExch(&lag_head[(r3 - r2) & 0xFFu], nz);
+#if !(TUNE_GV1_JOIN & 2)
+      lag_next[nz] = (uint16_t)prev;
+#endif
+#endif
+#if TUNE_GV1_JOIN & 2
+      // row offsets from the gate's A row (t = r2 + nz), and (without bit 8) the next column of the lag: the
+      // last one of a chain names itself
+      pk_idx[0][nz] = ((r1 - r2) & 0xFFu) | (((r3 - r2) & 0xFFu) << 8) | (((r4 - r2) & 0xFFu) << 16)
+                    | ((prev < 256u ? prev : nz) << 24);
+      pk_idx[1][nz] = ((s1 - r2) & 0xFFu) | (((s2 - r2) & 0xFFu) << 8) | (((s3 - r2) & 0xFFu) << 16)
+                    | (((s4 - r2) & 0xFFu) << 24);
+#else
+      pk_idx[0][nz] = r1 | (r2 << 8) | (r3 << 16) | (r4 << 24);
+      pk_idx[1][nz] = s1 | (s2 << 8) | (s3 << 16) | (s4 << 24);
+#endif
+    }
+    __syncthreads();
+
+#if TUNE_GV1_EXP == 51
+    const uint32_t n_a = 0;   // timing experiment: setup only
+#else
+    const uint32_t n_a = cand_n[0];
+#endif
+    const uint32_t n_b = cand_n[1];
+    // never-passing entries up to the next multiple of 32 (every warp writes the same values before it reads them)
+    cand_b[n_b + lane] = 0xFF800000u;
+#if TUNE_GV1_JOIN & 8
+    lag_head[nz] = kNone;   // for the next seed: the chains are packed, and the scan below walks lag_next only
+#endif
+    __syncwarp();
+
+    uint32_t sq_n = 0;   // queue length, uniform across the warp
+#if TUNE_GV1_JOIN & 64
+    uint32_t q_lo = 0;   // entries below this have their successors queued already (uniform across the warp)
+#endif
+
+// Same terms in the same order as `kernel` (rows: (r_i + nz) & 255 = (r_i - r2 + t) & 255).
+#if TUNE_GV1_JOIN & 2
+#define OMISSION_JOIN_ROWS                                                       \
+        const uint32_t ra = (w0 + t_) & 0xFFu, rb = ((w0 >> 8) + t_) & 0xFFu, rc = ((w0 >> 16) + t_) & 0xFFu;      \
+        const uint32_t rd = (w1 + t_) & 0xFFu, re = ((w1 >> 8) + t_) & 0xFFu, rf = ((w1 >> 16) + t_) & 0xFFu;      \
+        const uint32_t rg = ((w1 >> 24) + t_) & 0xFFu;
+#define OMISSION_JOIN_NZ ((t_ - idx_xy[0][nxv + 2]) & 0xFFu)
+#else
+#define OMISSION_JOIN_ROWS                                                       \
+        const uint32_t nzv_ = (t_ - (w0 >> 8)) & 0xFFu;                          \
+        const uint32_t ra = (w0 + nzv_) & 0xFFu, rb = ((w0 >> 16) + nzv_) & 0xFFu, rc = ((w0 >> 24) + nzv_) & 0xFFu; \
+        const uint32_t rd = (w1 + nzv_) & 0xFFu, re = ((w1 >> 8) + nzv_) & 0xFFu, rf = ((w1 >> 16) + nzv_) & 0xFFu;  \
+        const uint32_t rg = ((w1 >> 24) + nzv_) & 0xFFu;
+#define OMISSION_JOIN_NZ nzv_
+#endif
+#if TUNE_GV1_EXP == 53
+#define OMISSION_JOIN_SCORE   // timing experiment: join and queue without the score
+#else
+#define OMISSION_JOIN_SCORE                                                      \
+        OMISSION_JOIN_ROWS                                                       \
+        const float p0_ = conv_t[1][t_] + conv_t[2][rb];                         \
+        const float sc = p0_ + conv_t[0][ra] + conv_t[3][rc]                     \
+                       + conv_t[4][rd] + conv_t[5][re] + conv_t[6][rf] + conv_t[7][rg]; \
+        if (sc > kGradVecs1FinalThreshold && p0_ >= kGradVecs1GateZ0Threshold) { \
+          const uint32_t nzo_ = OMISSION_JOIN_NZ;                                \
+          uint32_t ri_ = atomicAdd(outputs.len, 1);                              \
+          if (ri_ < outputs.max_len) {                                           \
+            outputs.data[ri_] = {seed_index,                                     \
+                                 x_center + (int32_t)nxv * cell_size,            \
+                                 z_center + (int32_t)nzo_ * cell_size};          \
+          }                                                                      \
+        }
+#endif
+
+#if TUNE_GV1_JOIN & 8
+// scores the top ACTIVE entries of the queue
+#define OMISSION_JOIN_DRAIN(ACTIVE)                                              \
+    {                                                                            \
+      const uint32_t act_ = (ACTIVE);                                            \
+      __syncwarp();                                                              \
+      if (lane < act_) {                                                         \
+        const uint32_t e_ = score_q[warp][sq_n - act_ + lane];                   \
+        const uint32_t nxv = e_ >> 8, t_ = e_ & 0xFFu;                           \
+        const uint32_t w0 = pk_idx[0][nxv], w1 = pk_idx[1][nxv];                 \
+        OMISSION_JOIN_SCORE                                                      \
+      }                                                                          \
+      sq_n -= act_;                                                              \
+      __syncwarp();                                                              \
+    }
+// One A row against 32 B rows. A lane whose pair can pass queues the columns of the pair's lag: the packed three
+// in up to three stores (first columns of all lanes, then second, then third), the rest of a longer chain (2% of
+// the lags) one column per pass.
+#define OMISSION_JOIN_STEP(BB)                                                   \
+      {                                                                          \
+        const uint32_t bb_ = (BB);                                               \
+        uint32_t pk_ = 0u;                                                       \
+        if (__uint_as_float(bb_) >= ea.thr) { pk_ = lag_pk[(bb_ - ea.t) & 0xFFu]; } \
+        const uint32_t cnt_ = pk_ & 3u;                                          \
+        const uint32_t m1_ = __ballot_sync(0xFFFFFFFFu, cnt_ >= 1u);             \
+        if (m1_ != 0u) {                                                         \
+          const uint32_t m2_ = __ballot_sync(0xFFFFFFFFu, cnt_ >= 2u);           \
+          const uint32_t m3_ = __ballot_sync(0xFFFFFFFFu, cnt_ >= 3u);           \
+          const uint32_t n1_ = sq_n + __popc(m1_), n2_ = n1_ + __popc(m2_);      \
+          if (cnt_ >= 1u) { score_q[warp][sq_n + __popc(m1_ & lanemask_lt)] = (uint16_t)((pk_ & 0xFF00u) | ea.t); }         \
+          if (cnt_ >= 2u) { score_q[warp][n1_ + __popc(m2_ & lanemask_lt)] = (uint16_t)(((pk_ >> 8) & 0xFF00u) | ea.t); }   \
+          if (cnt_ >= 3u) { score_q[warp][n2_ + __popc(m3_ & lanemask_lt)] = (uint16_t)(((pk_ >> 16) & 0xFF00u) | ea.t); }  \
+          sq_n = n2_ + __popc(m3_);                                              \
+          while (sq_n >= 32u) { OMISSION_JOIN_DRAIN(32u) }                       \
+          uint32_t ko_ = kNone;                                                  \
+          if (pk_ & 4u) { ko_ = lag_next[pk_ >> 24]; }                           \
+          for (;;) {                                                             \
+            const uint32_t mo_ = __ballot_sync(0xFFFFFFFFu, ko_ < 256u);         \
+            if (mo_ == 0u) { break; }                                            \
+            if (ko_ < 256u) {                                                    \
+              score_q[warp][sq_n + __popc(mo_ & lanemask_lt)] = (uint16_t)((ko_ << 8) | ea.t); \
+              ko_ = lag_next[ko_];                                               \
+            }                                                                    \
+            sq_n += __popc(mo_);                                                 \
+            while (sq_n >= 32u) { OMISSION_JOIN_DRAIN(32u) }                     \
+          }                                                                      \
+        }                                                                        \
+      }
+#else
+// Scores the top ACTIVE entries of the queue; an entry whose column has a successor in its lag's chain goes back
+// with that column.
+#if TUNE_GV1_JOIN & 2
+#define OMISSION_JOIN_NEXT k2_ = w0 >> 24; if (k2_ == nxv) { k2_ = kNone; }
+#else
+#define OMISSION_JOIN_NEXT k2_ = lag_next[nxv];
+#endif
+#if TUNE_GV1_JOIN & 64
+// bit 64: entries below q_lo already have their successors in the queue (see the end of the seed)
+#define OMISSION_JOIN_UNEXPANDED && (sq_n + lane >= q_lo)
+#define OMISSION_JOIN_CLAMP if (q_lo > sq_n) { q_lo = sq_n; }   /* what is queued from here on is not expanded */
+#else
+#define OMISSION_JOIN_UNEXPANDED
+#define OMISSION_JOIN_CLAMP
+#endif
+#define OMISSION_JOIN_DRAIN(ACTIVE)                                              \
+    {                                                                            \
+      const uint32_t act_ = (ACTIVE);                                            \
+      uint32_t k2_ = kNone, t_ = 0;                                              \
+      __syncwarp();                                                              \
+      if (lane < act_) {                                                         \
+        const uint32_t e_ = score_q[warp][sq_n - act_ + lane];                   \
+        const uint32_t nxv = e_ >> 8;                                            \
+        t_ = e_ & 0xFFu;                                                         \
+        const uint32_t w0 = pk_idx[0][nxv], w1 = pk_idx[1][nxv];                 \
+        OMISSION_JOIN_NEXT                                                       \
+        OMISSION_JOIN_SCORE                                                      \
+      }                                                                          \
+      sq_n -= act_;                                                              \
+      const bool again_ = (k2_ < 256u) OMISSION_JOIN_UNEXPANDED;                 \
+      OMISSION_JOIN_CLAMP                                                        \
+      const uint32_t m2_ = __ballot_sync(0xFFFFFFFFu, again_);                   \
+      if (again_) { score_q[warp][sq_n + __popc(m2_ & lanemask_lt)] = (uint16_t)((k2_ << 8) | t_); } \
+      sq_n += __popc(m2_);                                                       \
+    }
+// one A row against 32 B rows: a lane whose pair can pass queues the first column of the pair's lag, if any
+#define OMISSION_JOIN_STEP(BB)                                                   \
+      {                                                                          \
+        const uint32_t bb_ = (BB);                                               \
+        uint32_t k_ = kNone;                                                     \
+        if (__uint_as_float(bb_) >= ea.thr) { k_ = lag_head[(bb_ - ea.t) & 0xFFu]; } \
+        const bool have_ = (k_ < 256u);                                          \
+        const uint32_t m_ = __ballot_sync(0xFFFFFFFFu, have_);                   \
+        if (m_ != 0u) {                                                          \
+          if (have_) { score_q[warp][sq_n + __popc(m_ & lanemask_lt)] = (uint16_t)((k_ << 8) | ea.t); } \
+          sq_n += __popc(m_);                                                    \
+          while (sq_n >= 32u) { OMISSION_JOIN_DRAIN(32u) }                       \
+        }                                                                        \
+      }
+// bit 32: both register chunks of the B list in one step (two tests, two lookups and two ballots that do not
+// wait for each other, one queue update)
+#define OMISSION_JOIN_STEP2                                                      \
+      {                                                                          \
+        uint32_t k0_ = kNone, k1_ = kNone;                                       \
+        if (__uint_as_float(bb0) >= ea.thr) { k0_ = lag_head[(bb0 - ea.t) & 0xFFu]; } \
+        if (__uint_as_float(bb1) >= ea.thr) { k1_ = lag_head[(bb1 - ea.t) & 0xFFu]; } \
+        const bool have0_ = (k0_ < 256u), have1_ = (k1_ < 256u);                 \
+        const uint32_t m0_ = __ballot_sync(0xFFFFFFFFu, have0_);                 \
+        const uint32_t m1_ = __ballot_sync(0xFFFFFFFFu, have1_);                 \
+        if ((m0_ | m1_) != 0u) {                                                 \
+          const uint32_t n0_ = sq_n + __popc(m0_);                               \
+          if (have0_) { score_q[warp][sq_n + __popc(m0_ & lanemask_lt)] = (uint16_t)((k0_ << 8) | ea.t); } \
+          if (have1_) { score_q[warp][n0_ + __popc(m1_ & lanemask_lt)] = (uint16_t)((k1_ << 8) | ea.t); }  \
+          sq_n = n0_ + __popc(m1_);                                              \
+          while (sq_n >= 32u) { OMISSION_JOIN_DRAIN(32u) }                       \
+        }                                                                        \
+      }
+#endif
+
+#if TUNE_GV1_JOIN & 4
+    // the first two chunks of the B list stay in registers for the whole seed (it is longer for a tenth of the seeds)
+#if TUNE_GV1_JOIN & 32
+    const uint32_t bb0 = cand_b[lane], bb1 = (n_b > 32u) ? cand_b[32u + lane] : 0xFF800000u;
+#else
+    const uint32_t bb0 = cand_b[lane], bb1 = cand_b[32u + lane];
+#endif
+#endif
+#if TUNE_GV1_JOIN & 16
+    // Diagonals instead of rows: lane l pairs its B entries with A row (s + l) mod n_a, so every step holds 32
+    // different A rows and the warps get even shares of the hits (the rows differ a lot in how many B they pass:
+    // dealt by row, the busiest warp of a seed has 1.6 times the average, by diagonal 1.2 times).
+    uint32_t lane_mod = lane;
+    while (lane_mod >= n_a && n_a != 0u) { lane_mod -= n_a; }
+#endif
+    for (uint32_t c = warp; c < n_a; c += block_dim_x / 32) {
+#if TUNE_GV1_JOIN & 16
+      const uint32_t cd_ = c + lane_mod;
+      const JoinA ea = cand_a[cd_ < n_a ? cd_ : cd_ - n_a];
+#else
+      const JoinA ea = cand_a[c];   // broadcast
+#endif
+#if (TUNE_GV1_JOIN & 32) && !(TUNE_GV1_JOIN & 8)
+      OMISSION_JOIN_STEP2
+      for (uint32_t j0 = 64u; j0 < n_b; j0 += 32u) { OMISSION_JOIN_STEP(cand_b[j0 + lane]) }
+#elif TUNE_GV1_JOIN & 4
+      OMISSION_JOIN_STEP(bb0)
+      if (n_b > 32u) { OMISSION_JOIN_STEP(bb1) }
+      for (uint32_t j0 = 64u; j0 < n_b; j0 += 32u) { OMISSION_JOIN_STEP(cand_b[j0 + lane]) }
+#else
+      for (uint32_t j0 = 0; j0 < n_b; j0 += 32u) { OMISSION_JOIN_STEP(cand_b[j0 + lane]) }
+#endif
+    }
+#if (TUNE_GV1_JOIN & 64) && !(TUNE_GV1_JOIN & 8)
+    // bit 64: what is left in the queue when the join ends (fewer than 32 entries) is not scored and re-queued
+    // one chain link at a time (four or five drains of a few lanes each): the successors are appended first, by
+    // passes that only read the chain, and the queue is then scored in one or two fuller drains. Entries below
+    // q_lo have been expanded; if the queue would overflow the passes stop and the rest goes on as before.
+    while (q_lo < sq_n && sq_n <= 64u) {
+      const uint32_t cnt_ = (sq_n - q_lo) < 32u ? (sq_n - q_lo) : 32u;
+      uint32_t k2_ = kNone, t_ = 0;
+      __syncwarp();
+      if (lane < cnt_) {
+        const uint32_t e_ = score_q[warp][q_lo + lane];
+        const uint32_t nxv = e_ >> 8;
+        t_ = e_ & 0xFFu;
+#if TUNE_GV1_JOIN & 2
+        k2_ = pk_idx[0][nxv] >> 24;
+        if (k2_ == nxv) { k2_ = kNone; }
+#else
+        k2_ = lag_next[nxv];
+#endif
+      }
+      const uint32_t mx_ = __ballot_sync(0xFFFFFFFFu, k2_ < 256u);
+      if (k2_ < 256u) { score_q[warp][sq_n + __popc(mx_ & lanemask_lt)] = (uint16_t)((k2_ << 8) | t_); }
+      q_lo += cnt_;
+      sq_n += __popc(mx_);
+    }
+    while (sq_n != 0u) { OMISSION_JOIN_DRAIN(sq_n < 32u ? sq_n : 32u) }
+#else
+    while (sq_n != 0u) { OMISSION_JOIN_DRAIN(sq_n < 32u ? sq_n : 32u) }
+#endif
+#undef OMISSION_JOIN_UNEXPANDED
+#undef OMISSION_JOIN_CLAMP
+#undef OMISSION_JOIN_STEP
+#undef OMISSION_JOIN_STEP2
+#undef OMISSION_JOIN_NEXT
+#undef OMISSION_JOIN_ROWS
+#undef OMISSION_JOIN_NZ
+#undef OMISSION_JOIN_DRAIN
+#undef OMISSION_JOIN_SCORE
+  }
+}
+#endif
 
 #if TUNE_GV1_V4
 // Same candidates as `kernel`, with the gate evaluated as a join instead of a scan.
@@ -2136,6 +2652,9 @@ __launch_bounds__(block_dim_x) void kernel_v4(
       for (int k = lag_head[(u_ - t_) & 0xFFu]; k >= 0; k = lag_next[k]) score_one((uint32_t)k, t_);
     };
 
+#if TUNE_GV1_EXP == 41
+    if (n_cand != 0xFFFFFFFFu) { continue; }   // timing experiment: setup only
+#endif
     // 1. join: a warp per A row, lanes over the B rows
     for (uint32_t c = warp; c < n_cand; c += block_dim_x / 32) {
       const uint32_t t = cand_t[c];
@@ -2157,6 +2676,9 @@ __launch_bounds__(block_dim_x) void kernel_v4(
       }
     }
     __syncthreads();
+#if TUNE_GV1_EXP == 42
+    if (n_cand != 0xFFFFFFFFu) { continue; }   // timing experiment: setup and join
+#endif
     // 2. expand pairs to (column, row) survivors
     {
       const uint32_t n_pairs = counters[2] < pair_cap ? counters[2] : pair_cap;
@@ -2181,6 +2703,9 @@ __launch_bounds__(block_dim_x) void kernel_v4(
       }
     }
     __syncthreads();
+#if TUNE_GV1_EXP == 43
+    if (n_cand != 0xFFFFFFFFu) { continue; }   // timing experiment: no scoring
+#endif
     // 3. score the survivors
     {
       const uint32_t n_surv = counters[3] < surv_cap ? counters[3] : surv_cap;
@@ -2778,7 +3303,9 @@ void run(
   // TUNE_GV1_BPS > 0 caps the grid at that many blocks per SM, which leaves room on every SM for blocks of the
   // seed hashing running beside it (TUNE_OVERLAP)
   static const int blocks = TUNE_GV1_BPS > 0 ? device_sms() * TUNE_GV1_BPS : 4096;
-#if TUNE_GV1_V4
+#if TUNE_GV1_JOIN
+  kernel_v5<<<blocks, block_dim_x, 0, stream>>>(seeds, outputs, results);
+#elif TUNE_GV1_V4
   kernel_v4<<<blocks, block_dim_x, 0, stream>>>(seeds, outputs, results);
 #elif TUNE_GV1_V3
   kernel_v3<<<blocks, block_dim_x, 0, stream>>>(seeds, outputs, results);
@@ -2828,6 +3355,16 @@ __launch_bounds__(block_dim_x) void kernel(
   // [axis][cell]: how many images fall in the cell, and which
   __shared__ uint32_t cell_n[2][by_cell ? 256 : 1];
   __shared__ uint16_t cell_img[2][by_cell ? 256 : 1][max_per_cell];
+#if TUNE_GV2_ROWS
+  // TUNE_GV2_ROWS (scan by cell only): a thread takes a lattice ROW and walks the columns. The gate reads four
+  // table entries at (column offset + row): with a column per thread those offsets are unrelated across a warp
+  // and every load lands on random banks (about 3 wavefronts); with a row per thread the 32 lanes read 32
+  // consecutive entries, one per bank, and the column's offsets arrive in one broadcast word. Same cells scored
+  // with the same sums, so the same candidates in another order.
+  static_assert(by_cell, "TUNE_GV2_ROWS is the transposed by-cell scan (unbounded builds)");
+  __shared__ uint32_t col_gate[256];      // lattice offsets of a column for the gate: [0][2], [0][3], [1][2], [1][3]
+  __shared__ uint32_t col_rest[256][2];   // the other eight: [L][0], [L][1], [L][4], [L][5] for layers L = 0, 1
+#endif
 
   for (uint32_t i = threadIdx.x; i < 288; i += blockDim.x) {
     reinterpret_cast<uint4*>(shared_kernel_0B)[i] =
@@ -2909,6 +3446,64 @@ __launch_bounds__(block_dim_x) void kernel(
       else { col = img_cell[0][threadIdx.x]; }
     }
 
+#if TUNE_GV2_ROWS
+    {
+      // every thread publishes its column's twelve lattice offsets, then turns to its row
+      uint32_t h[2][6];
+#pragma unroll
+      for (int32_t dnx = 0; dnx < 6; ++dnx) {
+        const int32_t idx_x = oct_0B.p[(col + dnx) & 0xFF];
+#pragma unroll
+        for (int32_t dny = 0; dny < 2; ++dny) {
+          h[dny][dnx] = oct_0B.p[(idx_x + ny + dny) & 0xFF];
+        }
+      }
+      col_gate[col] = h[0][2] | (h[0][3] << 8) | (h[1][2] << 16) | (h[1][3] << 24);
+      col_rest[col][0] = h[0][0] | (h[0][1] << 8) | (h[0][4] << 16) | (h[0][5] << 24);
+      col_rest[col][1] = h[1][0] | (h[1][1] << 8) | (h[1][4] << 16) | (h[1][5] << 24);
+    }
+    __syncthreads();
+    {
+      const uint32_t row = threadIdx.x;
+      uint32_t n_z = cell_n[1][row];
+      if (n_z > max_per_cell) { n_z = max_per_cell; }
+      if (n_z != 0) {
+        for (uint32_t c = 0; c < 256u; ++c) {
+          const uint32_t g = col_gate[c];   // broadcast
+          int32_t idx0[6], idx1[6];
+          idx0[2] = (int32_t)((g & 0xFFu) + row);
+          idx0[3] = (int32_t)(((g >> 8) & 0xFFu) + row);
+          idx1[2] = (int32_t)(((g >> 16) & 0xFFu) + row);
+          idx1[3] = (int32_t)((g >> 24) + row);
+          // the same four terms in the same order as score_center_2x2_t
+          const float gate = conv_z0[2][idx0[2] & 0xFF] + conv_z0[3][idx0[3] & 0xFF]
+                           + conv_z1[2][idx1[2] & 0xFF] + conv_z1[3][idx1[3] & 0xFF];
+          if (gate >= kGradVecs2PrefilterThreshold) {
+            const uint32_t e0 = col_rest[c][0], e1 = col_rest[c][1];
+            idx0[0] = (int32_t)((e0 & 0xFFu) + row);         idx1[0] = (int32_t)((e1 & 0xFFu) + row);
+            idx0[1] = (int32_t)(((e0 >> 8) & 0xFFu) + row);  idx1[1] = (int32_t)(((e1 >> 8) & 0xFFu) + row);
+            idx0[4] = (int32_t)(((e0 >> 16) & 0xFFu) + row); idx1[4] = (int32_t)(((e1 >> 16) & 0xFFu) + row);
+            idx0[5] = (int32_t)((e0 >> 24) + row);           idx1[5] = (int32_t)((e1 >> 24) + row);
+            const float score = score_full_12_t(conv_z0, conv_z1, idx0, idx1);
+            if (score > kGradVecs2FinalThreshold) {
+              uint32_t n_xc = cell_n[0][c];
+              if (n_xc > max_per_cell) { n_xc = max_per_cell; }
+              for (uint32_t a = 0; a < n_xc; ++a) {
+                const int32_t x = input.x + ((int32_t)cell_img[0][c][a] - grid_half_s) * cell_size_0A;
+                for (uint32_t b = 0; b < n_z; ++b) {
+                  const int32_t z = input.z + ((int32_t)cell_img[1][row][b] - grid_half_s) * cell_size_0A;
+                  uint32_t result_index = atomicAdd(outputs.len, 1);
+                  if (result_index < outputs.max_len) {
+                    outputs.data[result_index] = {input.seed_index, x, z, input_index + 1u};   // aux: which A candidate
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+#else
     if (n_x != 0) {
       int32_t hoisted_idx_xy[2][6];
 #pragma unroll
@@ -2961,6 +3556,7 @@ __launch_bounds__(block_dim_x) void kernel(
         }
       }
     }
+#endif   // TUNE_GV2_ROWS
   }
 }
 #else
@@ -4471,6 +5067,9 @@ void GpuThread::run() {
 #endif
 #if TUNE_GV1_V4
   TRY_CUDA(cudaFuncSetAttribute(KernelFilterGradVecs1::kernel_v4, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+#endif
+#if TUNE_GV1_JOIN
+  TRY_CUDA(cudaFuncSetAttribute(KernelFilterGradVecs1::kernel_v5, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
 #endif
   init_grad_dot_table();
   init_conv_kernels();

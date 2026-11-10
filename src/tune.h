@@ -215,6 +215,7 @@
 #endif
 
 // timing experiments (wrong results): kernel_v2: 1 = setup only, 2 = scan without queue/score; kernel: 11, 12 the same;
+// kernel_v4: 41 = setup, 42 = setup and join, 43 = no scoring; kernel_v5: 51 = setup, 53 = no scoring
 // kernel: 13 = as 12 with one lag for every lane, so the scan's B loads have no bank conflicts (12 against 13
 // shows how much of the scan the conflicts cost)
 #ifndef TUNE_GV1_EXP
@@ -257,6 +258,55 @@
 // gradvecs_1 gate as a join of the A-row and B-row lists with per-lag column lists (kernel_v4). Same candidates.
 #ifndef TUNE_GV1_V4
 #define TUNE_GV1_V4 0
+#endif
+
+// gradvecs_1 (kernel with TUNE_GV1_LEAN), three changes that keep the results and shorten the stage but not the
+// run on the cards measured (Pascal: stage -25% beside the hashing with the first two, total +-1%, because
+// the hashing gets that much less done in the meantime; Turing: no change, and TUNE_GV1_LEAN 4 with
+// TUNE_GV1_BK2 equals TUNE_GV1_LEAN 8 there, while TUNE_GV1_LEAN 4 alone, three blocks per SM, is 9% slower):
+//   TUNE_GV1_BK2       the scan's B rows stored twice in a row, so row + lag needs no wrap (one instruction less
+//                      per check and warp; +1 KiB of shared memory per copy)
+//   TUNE_GV1_HIT3      up to three hits per lane leave the hit loop per pass, and the survivor queue is scored
+//                      from the top (nothing moved after a drain)
+//   TUNE_GV1_RANKBITS  a lane's rank among the lanes of its lag class from one ballot per bit of the class
+//                      instead of one per class
+#ifndef TUNE_GV1_BK2
+#define TUNE_GV1_BK2 0
+#endif
+#ifndef TUNE_GV1_HIT3
+#define TUNE_GV1_HIT3 0
+#endif
+#ifndef TUNE_GV1_RANKBITS
+#define TUNE_GV1_RANKBITS 0
+#endif
+
+// gradvecs_1 gate as a join of the A-row and B-row lists on the warps, hits scored from one queue (kernel_v5).
+// Same candidates as `kernel`. A sum of bits:
+//    1: the kernel itself: a lane queues the first column of its pair's lag, and a scored entry whose column
+//       has a successor in the lag's chain goes back into the queue with it
+//    2: a column's lattice bytes stored as row offsets from the gate's A row, with the next column of its lag in
+//       the same word: one load and a few instructions less per scored hit
+//    4: the first 64 entries of the B list held in registers for the whole seed (no load per step of the join)
+//    8: the first three columns of a lag packed into one word and queued together (24 drains a seed at 27 of 32
+//       lanes instead of 39 at 17), for three ballots a step: slower (not with bit 32)
+//   16: the pair grid dealt to the warps by diagonals instead of by A rows, which evens out their shares of the
+//       hits (busiest warp of a seed 1.2 times the average instead of 1.6 times): slower, the A row is then a
+//       load per lane
+//   32: (with bit 4) both register chunks of the B list tested in one step
+//   64: at the end of a seed the successors of what is left in the queue are appended before it is scored
+// Measured against `kernel` with TUNE_GV1_LEAN and TUNE_GV1_PAIR, stage counts identical in every run.
+//   stage alone (overlap off), bits 1+2+4 (7): -8% on Pascal, -17% on Turing
+//   whole run with the hashing overlapped, bits 1+2+4+32 (39): +2.5% and +2.8% on Pascal (+3.0% to +3.2%
+//     together with TUNE_GV2_ROWS, also on a second Pascal card); no change on Turing, where the stage takes
+//     as long beside the hashing as `kernel` does
+//   without bit 32 (7, 71) the run is no faster than with `kernel`; bit 8 (15): 7% and 15% slower; bit 16 (55):
+//     1% slower than 39; bit 64 (103): 0.4% slower than 39
+//   with 39 the hashing must keep its TUNE_HASH_LEAN 2 blocks on a 96 KiB SM (one beside three of these blocks):
+//     smaller hashing blocks (TUNE_HASH_LEAN 3) or 2 or 4 of these per SM lose 2% to 7%
+// tools/analysis/gv1join.cpp has the arithmetic. Timing experiments (TUNE_GV1_EXP): 51 = tables and lists only,
+// 53 = no scoring.
+#ifndef TUNE_GV1_JOIN
+#define TUNE_GV1_JOIN 0
 #endif
 
 // seed hashing: seeds per thread and unroll of the per-seed loop
@@ -411,4 +461,13 @@
 // change on Turing (level 1 still reads half the score for every hit, and the second queue costs the rest).
 #ifndef TUNE_GV1_DRAIN3
 #define TUNE_GV1_DRAIN3 0
+#endif
+
+// gradvecs_2, unbounded (scan by cell): one lattice row per thread instead of one column, so the four gate loads
+// of a warp fall on 32 consecutive table entries (one wavefront each instead of about three) and a column's
+// offsets come as one broadcast word. Same cells, same sums, same candidates (in another order).
+// Measured, stage counts identical: the stage alone -18% on Pascal and -35% on Turing; the run
+// with the hashing overlapped +0.4% and +1.3%.
+#ifndef TUNE_GV2_ROWS
+#define TUNE_GV2_ROWS 0
 #endif
