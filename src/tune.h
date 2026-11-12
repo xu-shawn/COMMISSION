@@ -11,6 +11,11 @@
 // How these values were measured is written up in docs/search-economics.md.
 
 #if defined(TUNE_PRESET_RECORD) && TUNE_PRESET_RECORD
+// GPU generation the preset tunes the kernels for: compute capability x 10 (61 = Pascal GTX 10 series, 75 = Turing,
+// 86 = Ampere, 89 = Ada, 120 = Blackwell). The makefile sets it from ARCH or nvidia-smi; 75 when unknown.
+#  ifndef TUNE_PRESET_SM
+#    define TUNE_PRESET_SM 75
+#  endif
 // Island frequency falls off as exp(-350 d0^2 - 55 d1^2 - 4 d2^2) in the distance d of each octave's
 // vertical offset from the middle of its lattice layer, for islands of record size.  A level set of that
 // density keeps more islands per surviving seed than the weighted sum of |d| used before.
@@ -63,10 +68,23 @@
 #    define TUNE_JOINT_REUSE_A 1
 #  endif
 #  ifndef TUNE_GV1_BPS
-#    define TUNE_GV1_BPS 2
+#    define TUNE_GV1_BPS (TUNE_PRESET_SM < 70 ? 3 : 2)
 #  endif
 #  ifndef TUNE_A_BPS
-#    define TUNE_A_BPS 3
+#    define TUNE_A_BPS (TUNE_PRESET_SM < 70 ? 4 : 3)
+#  endif
+// Large biomes keep the lower cascade: the 140/420 cuts drop about half of the islands of 11.5-12M-equivalent
+// there (measured), which sits just below the large-biome bounded record. The cascade is cheap either way.
+#  if defined(OMISSION_LARGE_BIOMES) && OMISSION_LARGE_BIOMES
+#    ifndef TUNE_MIN_2B
+#      define TUNE_MIN_2B 110
+#    endif
+#    ifndef TUNE_MIN_2C
+#      define TUNE_MIN_2C 340
+#    endif
+#    ifndef TUNE_MIN_2D
+#      define TUNE_MIN_2D 1550
+#    endif
 #  endif
 // hand the CPU only candidates whose estimated area is at least 10.9 million blocks
 #  ifndef TUNE_MIN_2B
@@ -77,6 +95,63 @@
 #  endif
 #  ifndef TUNE_MIN_2D
 #    define TUNE_MIN_2D 1700
+#  endif
+// Kernel options, all exact: every stage passes the same seeds and positions as with them off (identical stage
+// counts on identical seeds; filter_2_01a may differ by a few in two million through float rounding of its sums).
+// Best settings measured per generation; the whole record search against the same build with them off:
+//   Pascal (sm_61), small biomes unbounded: 1.21x;  Turing (sm_75): 1.47x
+//   large biomes bounded: 1.18x and 1.49x
+// Newer GPUs (sm_80 and up) get the Turing settings, which are exact there too but were not timed there.
+#  ifndef TUNE_JOINT_SKIP_A
+#    define TUNE_JOINT_SKIP_A 1
+#  endif
+#  ifndef TUNE_A_NODES
+#    define TUNE_A_NODES 1
+#  endif
+#  ifndef TUNE_JOINT_NODES
+#    define TUNE_JOINT_NODES 1
+#  endif
+#  ifndef TUNE_GV1_PAIR
+#    define TUNE_GV1_PAIR 1
+#  endif
+#  ifndef TUNE_GV2_BPS
+#    define TUNE_GV2_BPS 2
+#  endif
+#  if TUNE_PRESET_SM < 70
+#    ifndef TUNE_HASH_KARG
+#      define TUNE_HASH_KARG 1
+#    endif
+#    ifndef TUNE_HASH_LEAN
+#      define TUNE_HASH_LEAN 2
+#    endif
+#    ifndef TUNE_GV1_LEAN
+#      define TUNE_GV1_LEAN 4
+#    endif
+#  else
+#    ifndef TUNE_HASH_LEAN
+#      define TUNE_HASH_LEAN 4
+#    endif
+#    ifndef TUNE_GV1_LEAN
+#      define TUNE_GV1_LEAN 8
+#    endif
+#    ifndef TUNE_JOINT_BPS
+#      define TUNE_JOINT_BPS 4
+#    endif
+#  endif
+// unbounded searches only: the row scan of the stack-B images (exact), the join kernel for gradvecs_1 on Pascal
+// (exact; not timed in bounded mode), and the full-A screen, a filter change: before pairing an A candidate with
+// all 109,561 B images it needs octaves 0A-2A below -0.55 at 32 of 256 samples. Live test: 5.6% fewer islands per
+// seed at every size, 10% faster, so about 3.6% more islands per GPU-hour. Bounded searches gain nothing from it.
+#  if defined(OMISSION_UNBOUND) && OMISSION_UNBOUND
+#    ifndef TUNE_GV2_ROWS
+#      define TUNE_GV2_ROWS 1
+#    endif
+#    if TUNE_PRESET_SM < 70 && !defined(TUNE_GV1_JOIN)
+#      define TUNE_GV1_JOIN 39
+#    endif
+#    ifndef TUNE_A2_MIN
+#      define TUNE_A2_MIN 32
+#    endif
 #  endif
 #endif
 

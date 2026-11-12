@@ -14,31 +14,39 @@ CUDA app that uses various clever tricks to produce mushroom islands of adequate
 
 ## Record search build (`PRESET=record`)
 
-This branch adds a tuned build for hunting islands of 11 million blocks and more. It finds about 1.5× the
-record-size islands per GPU-hour of the first version of this preset, and about 3× those of the unmodified
-program. Every threshold is a macro in `src/tune.h`; a plain `make` still searches exactly as before, except for
-a buffer race fixed in all builds.
+A tuned build for hunting record-size islands (11 million blocks and more). Every setting is a macro in
+`src/tune.h`; a plain `make` still searches exactly as before, except for a buffer race fixed in all builds.
 
 ```sh
-make PRESET=record                 # bounded small biomes   -> main-sb-record
-make PRESET=record UNBOUND=1       # unbounded small biomes -> main-sbu-record
+make PRESET=record                    # bounded small biomes    -> main-sb-record
+make PRESET=record UNBOUND=1          # unbounded small biomes  -> main-sbu-record
+make PRESET=record LARGE_BIOMES=1     # bounded large biomes    -> main-lb-record
+make PRESET=record ARCH=sm_61         # build for a GPU generation other than this machine's
 ./main-sb-record --device 0 --size 11000000 --start <your own start seed>
 ```
 
-- The preset only hands the CPU candidates estimated at 10.9M blocks and more, so use `--size 11000000`
-  (or at least 10,700,000). For smaller islands use the plain build.
-- Give every machine its own `--start`. Two runs with the same start scan the same seeds in the same order.
-- Bounded, RTX 4080 Super: 64 G seeds/s. Seeds per second are no longer comparable with other builds, since
-  the thresholds decide how many islands a seed yields.
-- An island above the current bounded record (12,618,448) takes about 22 days of one RTX 4080 Super, or
-  14 of an RTX 4090, give or take a factor of 2. That is about $120 on-demand.
-- What makes an island large, the size-dependent thresholds and the measurements are in
-  `docs/record-tuning.md`; the first round of tuning is in `docs/search-economics.md`. `tools/` has the
-  verification program and `tools/analysis/` the analysis programs, including a CPU port of the pipeline.
-- The preset was validated for small biomes only. The branch also fixes an overflow that made the
-  large-biomes CPU pre-test accept every candidate.
-- Prebuilt Linux binaries were built with `NVCC_FLAGS="--cudart static"` on CUDA 12.4 and need driver 550
-  or newer: `sm_86` for the 30 series, `sm_89` for the 40 and 50 series, `sm_75` for the 20 series.
+What the preset changes:
+
+- **Filters fitted to where large islands come from.** The seed filter is a quadratic score whose weights were
+  fitted to how island probability falls with each octave's vertical offset; the later thresholds were set on
+  tens of thousands of verified islands. These filters lose islands of every size at the same rate, so they were
+  tuned on ordinary large islands and then checked on the largest ones.
+- **Faster kernels, chosen for the GPU generation it is built for** (the makefile reads `ARCH`, or the first GPU's
+  compute capability from `nvidia-smi`): a leaner seed-hashing tail, a gradvecs_1 scan with fewer shared-memory
+  bank conflicts (and on Pascal a join of the A and B row lists), per-warp lattice-node tables in filter_2_01a and
+  the joint test, a row scan of the stack-B images, and grid caps that leave room for the overlapped hashing.
+  All of them are exact: on identical seeds every stage passes the same seeds and positions as without them.
+  Measured over the whole search: 1.21x on Pascal (GTX 10 series) and 1.47x on Turing for unbounded small biomes,
+  1.18x and 1.49x for bounded large biomes. Ampere, Ada and Blackwell get the Turing settings, which are exact
+  there too but have not been timed there.
+- **Unbounded builds screen A candidates on all of stack A's large octaves** before pairing each with its 109,561
+  stack-B images: 5.6% fewer islands per seed at every size, 10% faster, about 3.6% more islands per GPU-hour.
+- Large biomes keep a lower cascade cut, because the small-biome cut drops large-biome islands near the bounded
+  large-biome record.
+
+The `TUNE_*` notes in `src/tune.h` record each measurement. `docs/search-economics.md` and `docs/record-tuning.md`
+describe the earlier rounds of tuning; `tools/` has the verification programs and `tools/analysis/` the analysis
+programs, including a CPU port of the pipeline and a host emulator of the kernels (`tools/simt/`).
 
 ## Usage
 - Clone the repo 

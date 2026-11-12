@@ -27,7 +27,18 @@ override CFLAGS += -O3
 # Search tunables (src/tune.h):  make PRESET=record   or   make TUNE="-DTUNE_MAX_SCORE=0.046f"
 TUNE ?=
 ifeq ($(PRESET),record)
-  override TUNE += -DTUNE_PRESET_RECORD=1
+  # GPU generation for the preset's kernel settings: from ARCH=sm_XX, else the first GPU's compute capability
+  PRESET_SM := $(patsubst sm_%,%,$(filter sm_%,$(ARCH)))
+  ifeq ($(PRESET_SM),)
+    ifneq ($(OS),Windows_NT)
+      PRESET_SM := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 | tr -d .)
+    endif
+  endif
+  ifeq ($(PRESET_SM),)
+    PRESET_SM := 75
+  endif
+  $(info PRESET=record kernel settings for sm_$(PRESET_SM))
+  override TUNE += -DTUNE_PRESET_RECORD=1 -DTUNE_PRESET_SM=$(PRESET_SM)
 endif
 override CXXFLAGS += -O3 -std=c++20 -I asio/asio/include -DOMISSION_LARGE_BIOMES=$(LARGE_BIOMES) -DOMISSION_UNBOUND=$(UNBOUND) -DPRINT_INTERVAL=$(PRINT_INTERVAL) $(TUNE)
 override NVCC_FLAGS += $(CXXFLAGS) --expt-relaxed-constexpr --default-stream per-thread -arch=$(ARCH) -use_fast_math
